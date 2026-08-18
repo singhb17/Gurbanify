@@ -1,0 +1,191 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Shabad Library</title>
+<link rel="stylesheet" href="/static/style.css">
+</head>
+<body>
+
+<header>
+  <h1>Shabad Library</h1>
+  <button id="nav-toggle" class="nav-toggle" aria-label="Menu" aria-expanded="false">&#9776;</button>
+  <nav id="nav">
+    <button id="nav-list" class="active">My Library</button>
+    <button id="nav-deck">Deck</button>
+    <button id="nav-saved">Interested <span id="saved-count" class="badge"></span></button>
+    <button id="nav-learn">Learn <span id="learn-due" class="badge"></span></button>
+    <button id="nav-history">History</button>
+    <button id="nav-add">Full Search</button>
+  </nav>
+</header>
+
+<!-- ============ LIBRARY ============ -->
+<section id="view-list">
+  <div class="filters">
+    <div class="search-row">
+      <select id="f-mode" aria-label="search type">
+        <option value="firstletter" selected>First Letter Gurbani</option>
+        <option value="text">English Translation</option>
+      </select>
+      <input id="f-q" type="search" placeholder="First letters of a line, e.g. gkbvv">
+    </div>
+    <span class="muted" id="mode-hint">first letter of each word, like STTM &mdash; capitals are exact, so gkBBj is ਭ not ਬ</span>
+
+    <div class="toolbar">
+      <details class="filter-panel" id="lib-filter-wrap">
+        <summary>Filters<span id="lib-filter-count" class="fcount"></span></summary>
+        <div class="filter-pop">
+          <div id="filter-groups"></div>
+          <button id="f-clear" class="secondary">Clear all filters</button>
+        </div>
+      </details>
+      <label class="sort-label">Sort
+        <select id="f-sort">
+          <option value="id">Added</option>
+          <option value="line">First letter</option>
+          <option value="ang">Ang</option>
+          <option value="raag">Raag</option>
+          <option value="writer">Writer</option>
+          <option value="status">Status</option>
+          <option value="rarity">Rarity</option>
+        </select>
+      </label>
+      <span id="count"></span>
+    </div>
+  </div>
+  <div id="list"></div>
+</section>
+
+<!-- ============ DETAIL ============ -->
+<section id="view-detail" hidden>
+  <!-- sticky: stays reachable however far down the shabad you scroll -->
+  <div class="detail-bar">
+    <button id="back-to-list" class="secondary">&larr; Back</button>
+    <div class="detail-actions">
+      <button id="d-heart" class="heart" title="Add to Interested">&#9825;</button>
+      <button id="d-learn" class="secondary" title="Memorize this shabad">Learn</button>
+      <a id="d-sttm" class="linkbtn" target="_blank" rel="noopener"
+         title="Open on SikhiToTheMax">STTM &#8599;</a>
+      <button id="d-edit">Edit</button>
+    </div>
+  </div>
+  <div id="detail"></div>
+</section>
+
+<!-- ============ EDIT DIALOG ============ -->
+<dialog id="edit-dialog">
+  <div class="dialog-head">
+    <h2>My details</h2>
+    <button id="e-close" class="secondary" aria-label="Close">&times;</button>
+  </div>
+  <div id="edit-body"></div>
+  <div class="dialog-foot">
+    <button id="e-delete" class="danger">Delete shabad</button>
+    <span class="spacer"></span>
+    <button id="e-cancel" class="secondary">Cancel</button>
+    <button id="e-save">Save changes</button>
+  </div>
+</dialog>
+
+<!-- ============ SWIPE DECK ============ -->
+<section id="view-deck" hidden>
+  <details class="deck-filters" id="deck-filter-wrap">
+    <summary>Filters <span id="deck-filter-count" class="muted"></span></summary>
+    <div id="deck-filter-groups"></div>
+    <button id="deck-filter-clear" class="secondary">Clear deck filters</button>
+  </details>
+  <div class="deck-head">
+    <span class="muted" id="deck-status"></span>
+    <label class="toggle" title="Include shabads already in Interested">
+      <input type="checkbox" id="deck-include"> <span>Include Interested</span>
+    </label>
+    <button id="deck-reshuffle" class="secondary">Reshuffle</button>
+  </div>
+  <div id="deck"></div>
+  <div class="deck-controls">
+    <button id="deck-undo" class="secondary undo" title="Undo last swipe (Ctrl+Z)">&#8630;</button>
+    <button id="deck-pass" class="swipe-btn pass" title="Pass (left arrow)">&times;</button>
+    <button id="deck-open" class="secondary">Open</button>
+    <button id="deck-keep" class="swipe-btn keep" title="Interested (right arrow)">&hearts;</button>
+  </div>
+  <p class="muted deck-hint">Drag a card, use the buttons, or press &larr; / &rarr; &mdash; Ctrl+Z undoes</p>
+</section>
+
+<!-- ============ INTERESTED ============ -->
+<section id="view-saved" hidden>
+  <div class="row" style="justify-content:space-between">
+    <h2 id="saved-head">Interested</h2>
+    <button id="saved-clear" class="danger">Clear folder</button>
+  </div>
+  <div id="saved-list"></div>
+</section>
+
+<!-- ============ LEARN ============ -->
+<section id="view-learn" hidden>
+  <div class="learn-head">
+    <div>
+      <h2 id="learn-title">Memorizing</h2>
+      <span class="muted" id="learn-sub"></span>
+    </div>
+    <button id="learn-start">Start practice</button>
+  </div>
+  <div id="learn-list"></div>
+</section>
+
+<!-- ============ PRACTICE ============ -->
+<section id="view-practice" hidden>
+  <div class="practice-bar">
+    <button id="practice-quit" class="secondary">&larr; Done</button>
+    <div class="practice-meta">
+      <span id="practice-progress" class="muted"></span>
+      <span id="practice-timer" class="muted"></span>
+    </div>
+  </div>
+  <div id="practice"></div>
+</section>
+
+<!-- ============ HISTORY ============ -->
+<section id="view-history" hidden>
+  <div class="row" style="justify-content:space-between">
+    <h2 id="history-head">Recently opened</h2>
+    <button id="history-clear" class="secondary">Clear history</button>
+  </div>
+  <div id="history-list"></div>
+</section>
+
+<!-- ============ ADD ============ -->
+<section id="view-add" hidden>
+  <h2>Add a shabad</h2>
+  <div class="filters">
+    <div class="search-row">
+      <select id="s-mode" aria-label="search type">
+        <option value="firstletter" selected>First Letter Gurbani</option>
+        <option value="fullword">Full Word Gurbani</option>
+      </select>
+      <input id="s-q" type="search" placeholder="Type first letters, e.g. gkbvv" autocomplete="off">
+    </div>
+    <div class="row">
+      <label>Source
+        <select id="s-source">
+          <option value="">All</option>
+          <option value="G">Sri Guru Granth Sahib Ji</option>
+          <option value="D">Dasam Bani</option>
+          <option value="B">Bhai Gurdas Ji Vaaran</option>
+          <option value="N">Bhai Nand Lal Ji</option>
+          <option value="R">Panthic sources</option>
+        </select>
+      </label>
+      <span id="s-count"></span>
+    </div>
+  </div>
+  <div id="results"></div>
+  <div id="preview"></div>
+</section>
+
+<div id="toast" hidden></div>
+
+<script src="/static/app.js"></script>
+</body>
+</html>

@@ -1,0 +1,86 @@
+{
+  "_note": "Short names for the bench. `tokens_per_line` is MEASURED from real runs and used to estimate cost before spending; bench.py updates it after each run. Unknown models fall back to 1000. Optional `options` is merged into the request body -- use it to turn reasoning off, and register that as its OWN entry so both variants stay comparable.",
+  "gemini25": {
+    "id": "google/gemini-2.5-flash",
+    "tokens_per_line": 639
+  },
+  "gemini37": {
+    "id": "google/gemini-3.7-flash",
+    "tokens_per_line": 937
+  },
+  "gpt5mini": {
+    "id": "openai/gpt-5-mini",
+    "tokens_per_line": 1692
+  },
+  "gpt54mini": {
+    "id": "openai/gpt-5.4-mini",
+    "tokens_per_line": 646
+  },
+  "glm5": {
+    "id": "z-ai/glm-5",
+    "tokens_per_line": 1993
+  },
+  "glm47": {
+    "id": "z-ai/glm-4.7",
+    "tokens_per_line": 2261
+  },
+  "glm47nt": {
+    "id": "z-ai/glm-4.7",
+    "options": {
+      "reasoning": {
+        "enabled": false
+      }
+    },
+    "tokens_per_line": 812
+  },
+  "glm5nt": {
+    "id": "z-ai/glm-5",
+    "options": {
+      "reasoning": {
+        "enabled": false
+      }
+    },
+    "max_tokens_per_line": 1200,
+    "tokens_per_line": 818
+  },
+  "glm45air": {
+    "id": "z-ai/glm-4.5-air",
+    "options": {
+      "reasoning": {
+        "enabled": false
+      }
+    },
+    "max_tokens_per_line": 1200,
+    "tokens_per_line": 796
+  },
+  "gemini37batch": {
+    "id": "google/gemini-3.7-flash:batch",
+    "max_tokens_per_line": 1500
+  },
+  "qwen235": {
+    "id": "qwen/qwen3-235b-a22b-2507",
+    "tokens_per_line": 801
+  },
+  "deepseek": {
+    "id": "deepseek/deepseek-v4-pro-0813",
+    "tokens_per_line": 1680
+  },
+  "deepseeknt": {
+    "id": "deepseek/deepseek-v4-pro-0813",
+    "options": {
+      "reasoning": {
+        "enabled": false
+      }
+    },
+    "max_tokens_per_line": 1200,
+    "tokens_per_line": 743
+  },
+  "geminilite": {
+    "id": "google/gemini-3.1-flash-lite",
+    "tokens_per_line": 664
+  },
+  "kimi26": {
+    "id": "moonshotai/kimi-k2.6",
+    "tokens_per_line": 3561
+  }
+}

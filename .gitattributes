@@ -1,0 +1,12 @@
+# Normalise line endings so the repo stays identical across machines.
+# Without this, Windows checks files out with CRLF and every file looks
+# modified on the next machine that touches it.
+* text=auto
+
+# Shell scripts MUST keep LF. A CRLF .sh fails under bash with a confusing
+# "\r: command not found", which is a miserable thing to debug remotely.
+*.sh text eol=lf
+
+# Binary-ish: never convert, never diff as text.
+*.db binary
+*.pkl binary

@@ -1,0 +1,32 @@
+# ---- databases: these travel by hand, never through git (CLAUDE.md §8) ----
+# banidb.db is 90 MB and regenerable from BaniDB. shabads.db holds the
+# irreplaceable "mine" layer (§5) and must have exactly ONE live copy --
+# committing it gives you two that drift apart, and SQLite has no merge.
+*.db
+*.db-wal
+*.db-shm
+backups/
+
+# ---- secrets ----
+# Anything committed to a public repo is readable by anyone, forever, even
+# after a later deletion. Keys live in .env; .env.example shows the shape.
+.env
+
+# ---- personal library data ----
+# The Notion export is the "mine" layer (§5). It has already been imported
+# into shabads.db, so git gains nothing by carrying it, and a public repo
+# would publish the whole repertoire. Keep these in your backups instead.
+data/
+
+# ---- generated ----
+# vectors.pkl is 11 MB and BGE-M3 rebuilds it deterministically from the
+# summaries. compare.html is written by compare.py out of the same cache.
+search/cache/vectors.pkl
+search/out/
+
+# NOT ignored, on purpose: search/cache/summaries/*.json. Those are the
+# LLM summaries the bench paid for -- deleting them costs real money to
+# replace, which makes them the one generated artifact worth versioning.
+
+__pycache__/
+*.pyc

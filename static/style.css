@@ -1,0 +1,661 @@
+/* Dark, Notion-ish. Function over flair -- looks are still a later problem. */
+
+:root {
+  --bg:        #191919;
+  --surface:   #202020;
+  --surface-2: #252525;
+  --border:    #2f2f2f;
+  --border-hi: #4a4a4a;
+  --text:      #e4e4e4;
+  --text-dim:  #9a9a9a;
+  --text-faint:#6f6f6f;
+  --accent:    #4a90d9;
+  --danger:    #d9544f;
+
+  /* tag palette, matching the Notion table */
+  --gray-bg:   #373737; --gray-fg:   #a5a5a5;
+  --green-bg:  #24352c; --green-fg:  #6fbf8a;
+  --blue-bg:   #1f3a4d; --blue-fg:   #6cb2e0;
+  --orange-bg: #3a2c22; --orange-fg: #d9a06b;
+  --dim-bg:    #2a2a2a; --dim-fg:    #6f6f6f;
+}
+
+* { box-sizing: border-box; }
+
+body {
+  margin: 0; padding: 0 0 4rem;
+  font: 16px/1.55 system-ui, -apple-system, "Segoe UI", sans-serif;
+  color: var(--text); background: var(--bg);
+}
+
+header {
+  position: sticky; top: 0; z-index: 10;
+  display: flex; flex-wrap: wrap; gap: .5rem;
+  align-items: center; justify-content: space-between;
+  padding: .7rem 1rem;
+  background: var(--bg); border-bottom: 1px solid var(--border);
+}
+h1 { font-size: 1rem; margin: 0; font-weight: 600; letter-spacing: .01em; }
+h2 { font-size: .95rem; margin: 0 0 .5rem; color: var(--text-dim); font-weight: 600; }
+
+nav { display: flex; gap: .4rem; }
+
+/* Nav collapses to a menu rather than wrapping onto a second row, which was
+   doubling the header height on a phone and eating the top of every view. */
+.nav-toggle {
+  display: none; position: relative;
+  font-size: 1.15rem; line-height: 1; padding: .35rem .6rem;
+}
+/* practice waiting, visible without opening the menu */
+.nav-toggle.has-due::after {
+  content: ""; position: absolute; top: .18rem; right: .18rem;
+  width: .5rem; height: .5rem; border-radius: 50%;
+  background: var(--accent); border: 1px solid var(--bg);
+}
+
+@media (max-width: 700px) {
+  header { flex-wrap: nowrap; }
+  .nav-toggle { display: block; }
+  nav {
+    display: none; position: absolute; top: 100%; right: .6rem; z-index: 20;
+    flex-direction: column; align-items: stretch; gap: .25rem;
+    min-width: 12rem; padding: .4rem;
+    border: 1px solid var(--border-hi); border-radius: 8px;
+    background: var(--surface-2); box-shadow: 0 8px 24px rgba(0,0,0,.5);
+  }
+  nav.open { display: flex; }
+  nav button { text-align: left; border-color: transparent; background: transparent; }
+  nav button.active { background: var(--accent); }
+}
+
+button {
+  font: inherit; padding: .4rem .75rem; cursor: pointer;
+  border: 1px solid var(--border-hi); border-radius: 5px;
+  background: var(--surface-2); color: var(--text);
+}
+button:hover { border-color: #6a6a6a; }
+button.active { background: var(--accent); border-color: var(--accent); color: #fff; }
+button.secondary { background: transparent; color: var(--text-dim); }
+button.danger { background: transparent; border-color: var(--danger); color: var(--danger); }
+button.danger:hover { background: var(--danger); color: #fff; }
+button:disabled { opacity: .45; cursor: default; }
+
+section { padding: 1rem; max-width: 940px; margin: 0 auto; }
+
+input, select, textarea {
+  font: inherit; padding: .45rem .6rem;
+  border: 1px solid var(--border); border-radius: 5px;
+  background: var(--surface); color: var(--text);
+}
+input:focus, select:focus, textarea:focus {
+  outline: none; border-color: var(--accent);
+}
+input[type=search] { width: 100%; }
+textarea { width: 100%; min-height: 3.5rem; resize: vertical; }
+.field select { width: 100%; max-width: 18rem; }
+label { color: var(--text-dim); }
+
+.filters { display: flex; flex-direction: column; gap: .55rem; margin-bottom: 1rem; }
+
+/* search type and the box itself read as one control */
+.search-row { display: flex; gap: .4rem; align-items: stretch; }
+.search-row select { flex: 0 0 auto; width: 12.5rem; }
+.search-row input[type=search] { flex: 1 1 auto; min-width: 0; }
+@media (max-width: 560px) {
+  .search-row { flex-direction: column; }
+  .search-row select { width: 100%; }
+}
+#mode-hint { margin-top: -.15rem; }
+.row { display: flex; flex-wrap: wrap; gap: .55rem; align-items: center; }
+
+/* Filters, sort and count on one tidy line instead of chips sprayed across the
+   page. The chips only exist while the panel is open. */
+.toolbar { position: relative; display: flex; flex-wrap: wrap; gap: .6rem; align-items: center; }
+.toolbar .sort-label { display: flex; gap: .35rem; align-items: center; font-size: .85rem; }
+.toolbar #count { margin-left: auto; color: var(--text-faint); font-size: .85rem; }
+
+.filter-panel {
+  position: relative;
+  border: 1px solid var(--border); border-radius: 6px; background: var(--surface);
+}
+.filter-panel > summary {
+  cursor: pointer; list-style: none; user-select: none;
+  padding: .45rem .7rem; font-size: .85rem; color: var(--text-dim);
+}
+.filter-panel > summary::-webkit-details-marker { display: none; }
+.filter-panel > summary::after { content: " ▾"; color: var(--text-faint); }
+.filter-panel[open] > summary::after { content: " ▴"; }
+.filter-panel > summary:hover { color: var(--text); }
+.fcount:not(:empty) {
+  display: inline-block; min-width: 1.1rem; margin-left: .4rem; padding: 0 .3rem;
+  font-size: .7rem; text-align: center; border-radius: 8px;
+  background: var(--accent); color: #fff;
+}
+/* The chips float over the list instead of shoving it down, so opening the
+   filters doesn't move every card you were looking at. */
+.filter-pop {
+  position: absolute; top: calc(100% + .35rem); left: 0; z-index: 15;
+  display: flex; flex-direction: column; gap: .7rem;
+  min-width: min(28rem, calc(100vw - 2rem)); padding: .8rem;
+  border: 1px solid var(--border-hi); border-radius: 8px;
+  background: var(--surface-2); box-shadow: 0 10px 28px rgba(0,0,0,.5);
+}
+.filter-pop #filter-groups { display: flex; flex-direction: column; gap: .5rem; }
+.filter-pop #f-clear { align-self: flex-start; }
+
+/* filter chips */
+.chips { display: flex; flex-wrap: wrap; gap: .3rem; align-items: center; }
+.chips b {
+  font-weight: 500; font-size: .72rem; min-width: 3.4rem;
+  color: var(--text-faint); text-transform: uppercase; letter-spacing: .04em;
+}
+.chip {
+  padding: .18rem .6rem; font-size: .8rem; cursor: pointer;
+  border: 1px solid var(--border); border-radius: 4px;
+  background: var(--surface); color: var(--text-dim);
+}
+.chip:hover { border-color: var(--border-hi); color: var(--text); }
+.chip.on { background: var(--accent); border-color: var(--accent); color: #fff; }
+
+/* coloured value tags, like the Notion table */
+.tag {
+  display: inline-block; padding: .1rem .45rem; margin: 0 .15rem .15rem 0;
+  font-size: .78rem; border-radius: 3px; white-space: nowrap;
+}
+.t-gray   { background: var(--gray-bg);   color: var(--gray-fg); }
+.t-green  { background: var(--green-bg);  color: var(--green-fg); }
+.t-blue   { background: var(--blue-bg);   color: var(--blue-fg); }
+.t-orange { background: var(--orange-bg); color: var(--orange-fg); }
+.t-dim    { background: var(--dim-bg);    color: var(--dim-fg); font-style: italic; }
+
+/* list -- two columns on a wide screen so cards stay short, stacked on a phone */
+.card {
+  display: flex; gap: 1rem; align-items: flex-start;
+  padding: .55rem .8rem; margin-bottom: .4rem; cursor: pointer;
+  border: 1px solid var(--border); border-radius: 7px; background: var(--surface);
+}
+.card:hover { border-color: var(--border-hi); background: var(--surface-2); }
+.card-main { flex: 1 1 auto; min-width: 0; }        /* min-width:0 lets long lines wrap */
+
+/* Sized from the real data: tag rows are p95 367px, meta p95 297px. At 24rem
+   only ~3% of tag rows wrap, versus 19% at 20rem. The card is as tall as its
+   tallest column, so a side column that wraps is what makes cards grow. */
+.card-side { flex: 0 0 auto; width: 24rem; text-align: right; }
+
+.gurmukhi { font-size: 1.15rem; line-height: 1.6; color: var(--text); }
+.card .en { font-size: .84rem; color: var(--text-dim); line-height: 1.35; }
+.card .en:empty { display: none; }
+
+/* Every card exactly the same height: one line each, cut with an ellipsis
+   rather than wrapping. A wrapped line would make that one card twice as tall
+   and break the rhythm of the list. Full text is a click away in the detail
+   view, which never truncates. */
+.card .gurmukhi,
+.card .en,
+.card .in-shabad-line {
+  white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
+}
+.meta { font-size: .75rem; color: var(--text-faint); }
+.meta span { margin-left: .5rem; white-space: nowrap; }
+.card-side .meta { margin-top: .25rem; }
+.card-side .tag { margin: 0 0 .15rem .22rem; }
+.tags-row { margin-top: .35rem; }
+
+/* Below the point where two columns still fit, go back to one. 24rem of side
+   plus a readable Gurmukhi line needs roughly 860px. */
+@media (max-width: 860px) {
+  .card { display: block; }
+  .card-side { width: auto; text-align: left; margin-top: .4rem; }
+  .card-side .tag { margin: 0 .22rem .15rem 0; }
+  .meta span { margin: 0 .5rem 0 0; }
+}
+
+@media (max-width: 780px) {
+  /* stats are noise on a phone -- the line, its meaning and the tags are what matter */
+  .card-side .meta { display: none; }
+}
+
+/* the shabad a matched line belongs to */
+.in-shabad {
+  margin-top: .5rem; padding-left: .65rem;
+  border-left: 2px solid var(--border-hi);
+  color: var(--text-dim); font-size: .95rem;
+}
+.in-shabad .no {
+  display: block; font-size: .7rem; color: var(--text-faint);
+  text-transform: uppercase; letter-spacing: .04em;
+}
+
+/* search highlight -- the point is seeing the hit at a glance */
+mark {
+  background: #4a3620; color: #ffce7a;
+  padding: 0 .12em; border-radius: 2px;
+}
+
+/* ---------- detail ---------- */
+
+/* sticky so Back stays reachable however far down a 63-line shabad you scroll */
+.detail-bar {
+  position: sticky; top: var(--header-h, 3.4rem); z-index: 9;
+  display: flex; gap: .5rem; align-items: center; justify-content: space-between;
+  margin: -1rem -1rem .8rem; padding: .55rem 1rem;
+  background: var(--bg); border-bottom: 1px solid var(--border);
+}
+/* One row of controls that read as a set: same height, same radius, same gap.
+   Previously the heart was a bare glyph and the index badge sat between the
+   buttons, so nothing lined up and status looked like a broken button. */
+.detail-actions { display: flex; gap: .4rem; align-items: center; }
+.detail-bar button,
+.detail-bar .linkbtn {
+  display: inline-flex; align-items: center; justify-content: center;
+  height: 2.25rem; padding: 0 .8rem; font-size: .88rem;
+  border-radius: 6px; white-space: nowrap;
+}
+.linkbtn {
+  text-decoration: none;
+  border: 1px solid var(--border-hi); background: var(--surface-2); color: var(--text-dim);
+}
+.linkbtn:hover { color: var(--text); border-color: #6a6a6a; }
+.linkbtn[hidden] { display: none; }
+
+/* the heart matches the other controls instead of floating as a bare glyph */
+.detail-bar .heart {
+  width: 2.25rem; padding: 0; font-size: 1.15rem;
+  border-color: var(--border-hi); background: var(--surface-2);
+}
+.detail-bar .heart.on { color: var(--green-fg); border-color: var(--green-fg); }
+#d-edit { border-color: var(--accent); background: var(--accent); color: #fff; }
+#d-edit:hover { background: #5a9de3; border-color: #5a9de3; }
+
+@media (max-width: 560px) {
+  .detail-bar { padding: .5rem .7rem; margin: -1rem -1rem .8rem; }
+  .detail-actions { gap: .3rem; }
+  .detail-bar button, .detail-bar .linkbtn { height: 2.1rem; padding: 0 .55rem; font-size: .82rem; }
+  .detail-bar .heart { width: 2.1rem; }
+  #back-to-list { font-size: 0; padding: 0 .6rem; }        /* arrow only */
+  #back-to-list::before { content: "←"; font-size: 1rem; }
+}
+
+.hero-notes {
+  margin-top: .6rem; padding: .5rem .7rem;
+  border-left: 2px solid var(--border-hi); border-radius: 4px;
+  background: var(--surface-2); color: var(--text-dim); font-size: .9rem;
+  white-space: pre-wrap;
+}
+.all-lines { margin-top: 1rem; }
+
+/* ---------- edit dialog ---------- */
+
+#edit-dialog {
+  width: min(46rem, calc(100vw - 2rem)); max-height: 85vh; padding: 0;
+  border: 1px solid var(--border-hi); border-radius: 12px;
+  background: var(--surface); color: var(--text);
+  box-shadow: 0 18px 50px rgba(0,0,0,.6);
+}
+#edit-dialog::backdrop { background: rgba(0,0,0,.62); backdrop-filter: blur(2px); }
+.dialog-head {
+  position: sticky; top: 0;
+  display: flex; align-items: center; justify-content: space-between;
+  padding: .8rem 1rem; background: var(--surface);
+  border-bottom: 1px solid var(--border);
+}
+.dialog-head h2 { margin: 0; }
+#edit-body { padding: 1rem; overflow-y: auto; max-height: calc(85vh - 8rem); }
+.dialog-foot {
+  position: sticky; bottom: 0;
+  display: flex; flex-wrap: wrap; gap: .6rem; align-items: center;
+  padding: .8rem 1rem; background: var(--surface);
+  border-top: 1px solid var(--border);
+}
+.dialog-foot .spacer { flex: 1 1 auto; }
+
+.line { padding: .65rem 0; border-bottom: 1px solid var(--border); }
+.line.mine {
+  background: #1e2a33; border-left: 3px solid var(--accent);
+  padding-left: .65rem; border-radius: 4px;
+}
+.line .en { font-size: .87rem; color: var(--text-dim); }
+.line .pa { font-size: .87rem; color: var(--text-faint); }
+.line .no {
+  font-size: .7rem; color: var(--text-faint);
+  text-transform: uppercase; letter-spacing: .04em;
+}
+
+/* the line this shabad is known by, given the room it deserves */
+.hero {
+  padding: .9rem 1rem; margin-bottom: .4rem;
+  border: 1px solid var(--border); border-radius: 8px; background: var(--surface);
+}
+.gurmukhi.big { font-size: 1.85rem; line-height: 1.55; }
+.hero-en { font-size: 1rem; color: var(--text-dim); margin-top: .3rem; }
+.hero-pa { font-size: .92rem; color: var(--text-faint); margin-top: .2rem; }
+.hero .tags-row { margin-top: .7rem; }
+.hero .meta { margin-top: .45rem; }
+.hero .meta span { margin: 0 .7rem 0 0; }
+
+/* two columns on a wide screen -- the form was one narrow stack in a wide page */
+.form-grid {
+  display: grid; gap: 0 1.4rem;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  align-items: start;
+}
+.form-grid .wide { grid-column: 1 / -1; }
+@media (max-width: 720px) {
+  .form-grid { grid-template-columns: 1fr; }
+}
+
+.field { margin-bottom: .8rem; }
+/* direct child only -- otherwise this also uppercases the chip labels inside,
+   which turned "Not chosen" into "NOT CHOSEN" */
+.field > label {
+  display: block; font-size: .72rem; font-weight: 500; margin-bottom: .25rem;
+  color: var(--text-faint); text-transform: uppercase; letter-spacing: .04em;
+}
+
+/* collapsed by default -- the lines are reference, not the main event */
+.lines-toggle { margin-top: 1.4rem; border-top: 1px solid var(--border); }
+.lines-toggle > summary {
+  cursor: pointer; padding: .7rem 0; list-style: none;
+  font-size: .85rem; color: var(--text-dim); user-select: none;
+}
+.lines-toggle > summary::-webkit-details-marker { display: none; }
+.lines-toggle > summary::before { content: "▸ "; color: var(--text-faint); }
+.lines-toggle[open] > summary::before { content: "▾ "; }
+.lines-toggle > summary:hover { color: var(--text); }
+
+/* destructive action kept away from Save */
+.danger-zone {
+  display: flex; flex-wrap: wrap; gap: .6rem; align-items: center;
+  margin-top: 1.6rem; padding-top: .9rem; border-top: 1px solid var(--border);
+}
+.danger-zone .muted { flex: 1 1 14rem; }
+
+.result {
+  padding: .65rem; margin-bottom: .4rem; cursor: pointer;
+  border: 1px solid var(--border); border-radius: 6px; background: var(--surface);
+}
+.result:hover { border-color: var(--border-hi); background: var(--surface-2); }
+.result.have { opacity: .5; }
+
+#toast {
+  position: fixed; left: 50%; bottom: 1.2rem; transform: translateX(-50%);
+  padding: .55rem 1rem; border-radius: 6px; z-index: 50;
+  background: #2f2f2f; color: var(--text); font-size: .88rem;
+  border: 1px solid var(--border-hi);
+}
+#toast.error { background: #3a1f1e; border-color: var(--danger); color: #ffb3b0; }
+
+/* ---------- swipe deck ---------- */
+
+.deck-filters {
+  flex: 0 0 auto;
+  margin-bottom: .8rem; padding: .55rem .8rem;
+  border: 1px solid var(--border); border-radius: 7px; background: var(--surface);
+}
+.deck-filters > summary {
+  cursor: pointer; list-style: none; user-select: none;
+  font-size: .85rem; color: var(--text-dim);
+}
+.deck-filters > summary::-webkit-details-marker { display: none; }
+.deck-filters > summary::before { content: "▸ "; color: var(--text-faint); }
+.deck-filters[open] > summary::before { content: "▾ "; }
+.deck-filters > summary:hover { color: var(--text); }
+.deck-filters #deck-filter-groups {
+  display: flex; flex-direction: column; gap: .5rem; margin: .7rem 0;
+}
+
+.deck-head {
+  flex: 0 0 auto;
+  display: flex; gap: .8rem; align-items: center; justify-content: space-between;
+  margin-bottom: .6rem;
+}
+.deck-head #deck-status { margin-right: auto; }
+
+.toggle {
+  display: inline-flex; align-items: center; gap: .35rem;
+  font-size: .82rem; color: var(--text-dim); cursor: pointer; user-select: none;
+}
+.toggle input { accent-color: var(--accent); margin: 0; }
+@media (max-width: 560px) { .toggle span { display: none; } }
+
+/* Fixed height so the controls below don't jump as cards of different lengths
+   come up. The stack is absolutely positioned inside it. */
+/* The deck fills the window: no page scrolling, the card takes what's left over
+   after the filters and the buttons. --header-h is measured in JS rather than
+   hardcoded, because the nav wraps to a second row on a narrow screen and any
+   fixed guess would be wrong on one of the two. */
+body.deck-view { padding-bottom: 0; overflow: hidden; }
+
+#view-deck:not([hidden]) {
+  display: flex; flex-direction: column;
+  height: calc(100vh - var(--header-h, 3.6rem));
+  height: calc(100dvh - var(--header-h, 3.6rem));   /* dvh: mobile url bar */
+  padding-bottom: .7rem;
+}
+
+#deck { position: relative; flex: 1 1 auto; min-height: 11rem; }
+
+.swipe-card {
+  position: absolute; inset: 0;
+  display: flex; flex-direction: column;
+  padding: 1rem 1.1rem .8rem; overflow: hidden;
+  border: 1px solid var(--border); border-radius: 12px;
+  background: var(--surface);
+  box-shadow: 0 6px 22px rgba(0,0,0,.35);
+  cursor: grab; user-select: none;
+  /* pan-y hands vertical scrolling to the browser and keeps horizontal for us */
+  touch-action: pan-y;
+  /* each card behind the top one sits slightly lower and narrower */
+  transform: translateY(calc(var(--depth, 0) * 10px)) scale(calc(1 - var(--depth, 0) * .035));
+  transition: transform .17s ease, opacity .17s ease;
+}
+
+/* the shabad itself: the only part that scrolls, so the card stays one height
+   no matter whether the shabad is 4 lines or 40 */
+.card-lines {
+  position: relative;                /* .dline offsetTop is measured against this */
+  flex: 1 1 auto; min-height: 0; overflow-y: auto; overscroll-behavior: contain;
+  padding-right: .4rem;
+}
+.card-lines::-webkit-scrollbar { width: 6px; }
+.card-lines::-webkit-scrollbar-thumb { background: var(--border-hi); border-radius: 3px; }
+
+.dline { padding: .5rem 0; border-bottom: 1px solid var(--border); }
+.dline:last-child { border-bottom: none; }
+.dline .gurmukhi { font-size: 1.2rem; line-height: 1.65; }
+.dline .en { font-size: .84rem; color: var(--text-dim); line-height: 1.4; margin-top: .1rem; }
+
+/* the line I know the shabad by */
+.dline.mine {
+  background: #1e2a33; border-left: 3px solid var(--accent);
+  padding-left: .6rem; border-radius: 4px;
+}
+.dline.mine .gurmukhi { font-size: 1.35rem; }
+.dline.mine .en { color: var(--text); }
+
+.card-foot {
+  flex: 0 0 auto; padding-top: .6rem; margin-top: .5rem;
+  border-top: 1px solid var(--border);
+}
+.swipe-card[data-i="0"] { --depth: 0; }
+.swipe-card[data-i="1"] { --depth: 1; opacity: .75; }
+.swipe-card[data-i="2"] { --depth: 2; opacity: .45; }
+
+/* no transition while a finger is on it, or the card lags behind the pointer */
+.swipe-card.dragging { transition: none; cursor: grabbing; }
+.swipe-card.gone { opacity: 0; }
+
+.swipe-card .tags-row { margin-bottom: .25rem; }
+
+/* Verdict stamps. --lean runs -1 .. 1 as the card is dragged, so the label
+   fades in exactly as far as the card has travelled -- you can see what a
+   release would do before you let go. */
+.swipe-badge {
+  position: absolute; top: 1rem; padding: .2rem .6rem;
+  font-size: .8rem; font-weight: 600; letter-spacing: .06em; text-transform: uppercase;
+  border: 2px solid currentColor; border-radius: 5px; opacity: 0; pointer-events: none;
+}
+.swipe-badge.keep { right: 1rem; color: var(--green-fg); transform: rotate(12deg);
+                    opacity: max(0, var(--lean, 0)); }
+.swipe-badge.pass { left: 1rem;  color: var(--danger);   transform: rotate(-12deg);
+                    opacity: max(0, calc(var(--lean, 0) * -1)); }
+
+.deck-empty {
+  display: flex; flex-direction: column; justify-content: center; align-items: center;
+  height: 100%; gap: .3rem; text-align: center; padding: 1.5rem;
+  border: 1px dashed var(--border); border-radius: 12px;
+}
+
+.deck-controls {
+  flex: 0 0 auto;
+  display: flex; gap: 1rem; align-items: center; justify-content: center;
+  margin-top: .9rem;
+}
+.swipe-btn {
+  width: 3.4rem; height: 3.4rem; border-radius: 50%;
+  font-size: 1.5rem; line-height: 1; padding: 0;
+}
+.swipe-btn.pass { color: var(--danger); border-color: var(--danger); }
+.swipe-btn.keep { color: var(--green-fg); border-color: var(--green-fg); }
+.swipe-btn.pass:hover:not(:disabled) { background: var(--danger); color: #fff; }
+.swipe-btn.keep:hover:not(:disabled) { background: var(--green-bg); }
+
+/* deliberately quieter than pass/keep -- a correction, not a main action */
+.undo {
+  width: 2.5rem; height: 2.5rem; border-radius: 50%;
+  padding: 0; font-size: 1.15rem; line-height: 1;
+}
+.deck-hint { flex: 0 0 auto; text-align: center; margin: .6rem 0 0; }
+
+@media (max-width: 560px) {
+  .deck-hint { display: none; }        /* no arrow keys on a phone */
+  .deck-filters { margin-bottom: .5rem; }
+  .deck-head { margin-bottom: .4rem; }
+}
+
+/* count on the Interested nav button */
+.badge {
+  display: inline-block; min-width: 1.15rem; padding: 0 .3rem; margin-left: .2rem;
+  font-size: .72rem; text-align: center; border-radius: 9px;
+  background: var(--accent); color: #fff;
+}
+.badge:empty { display: none; }
+
+.unsave { padding: .05rem .4rem; margin-left: .5rem; line-height: 1; }
+
+/* when a shabad was opened -- the only thing that makes the history a history */
+.meta .when { color: var(--text-dim); }
+
+.card-btns { flex: 0 0 auto; display: flex; align-self: center; gap: .1rem; }
+.unlog {
+  padding: .2rem .45rem; font-size: 1rem; line-height: 1;
+  background: transparent; border-color: transparent; color: var(--text-faint);
+}
+.unlog:hover { border-color: var(--danger); color: var(--danger); }
+@media (max-width: 780px) {
+  /* stats hide on a phone, but the timestamp is the point of this list */
+  #history-list .card-side .meta { display: block; }
+  #history-list .card-side .meta span:not(.when) { display: none; }
+}
+
+/* add to Interested straight from the library list */
+.heart {
+  flex: 0 0 auto; align-self: center;
+  padding: .2rem .45rem; font-size: 1.1rem; line-height: 1;
+  background: transparent; border-color: transparent; color: var(--text-faint);
+}
+.heart:hover { border-color: var(--border-hi); color: var(--green-fg); }
+.heart.on { color: var(--green-fg); }
+@media (max-width: 860px) {
+  /* The card is one column on a phone, so pin its buttons to the top right.
+     Scoped to `.card >` deliberately: unscoped, this also absolutely positioned
+     the detail bar's heart, which then sat on top of the Edit button. */
+  .card { position: relative; }
+  .card > .heart { position: absolute; top: .4rem; right: .4rem; }
+  .card-main { padding-right: 2.2rem; }
+  /* in history they're a pair, so keep them together instead of stacking */
+  .card > .card-btns { position: absolute; top: .4rem; right: .4rem; }
+  .card-btns .heart { position: static; }
+  #history-list .card-main { padding-right: 4.2rem; }
+}
+
+/* ---------- memorization ---------- */
+
+.learn-head {
+  display: flex; gap: 1rem; align-items: flex-start; justify-content: space-between;
+  margin-bottom: 1rem;
+}
+.learn-head h2 { margin: 0 0 .15rem; }
+
+.learn-card.due { border-color: var(--accent); }
+.due-flag { color: var(--accent); }
+
+/* how far through the scaffold this shabad's lines are, on average */
+.bar {
+  height: 4px; margin-top: .5rem; border-radius: 2px;
+  background: var(--surface-2); overflow: hidden;
+}
+.bar span { display: block; height: 100%; background: var(--accent); }
+
+#d-learn.on { border-color: var(--green-fg); color: var(--green-fg); }
+
+/* AI summary + embedding status, shown with the other facts about the shabad.
+   Counts stay in the tooltip so this reads at a glance. */
+.idx {
+  display: inline-flex; align-items: center; gap: .35rem;
+  margin-left: .5rem; padding: .1rem .45rem;
+  font-size: .72rem; border-radius: 3px; white-space: nowrap; cursor: default;
+}
+.idx::before {
+  content: ""; width: .45rem; height: .45rem; border-radius: 50%;
+  background: currentColor; flex: 0 0 auto;
+}
+.idx.none { background: #3a1f1e; color: #e0736e; }
+.idx.part { background: var(--orange-bg); color: var(--orange-fg); }
+.idx.done { background: var(--green-bg); color: var(--green-fg); }
+
+.practice-bar {
+  position: sticky; top: var(--header-h, 3.4rem); z-index: 9;
+  display: flex; gap: .5rem; align-items: center; justify-content: space-between;
+  margin: -1rem -1rem 1rem; padding: .55rem 1rem;
+  background: var(--bg); border-bottom: 1px solid var(--border);
+}
+.practice-meta { display: flex; gap: .9rem; align-items: center; }
+#practice-timer { font-variant-numeric: tabular-nums; }
+
+.drill {
+  padding: 1.4rem 1.2rem;
+  border: 1px solid var(--border); border-radius: 12px; background: var(--surface);
+}
+.drill-tag {
+  font-size: .72rem; text-transform: uppercase; letter-spacing: .05em;
+  color: var(--text-faint); margin-bottom: .6rem;
+}
+.drill .gurmukhi.big { margin: .3rem 0; }
+.drill-en { margin-top: .5rem; color: var(--text-dim); font-size: 1rem; }
+.drill-teeka { margin-top: .4rem; color: var(--text-faint); font-size: .92rem; }
+.drill-note { margin: 1rem 0 0; }
+.drill-actions { display: flex; flex-wrap: wrap; gap: .6rem; margin-top: 1.2rem; }
+.drill input { width: 100%; margin-top: 1rem; font-size: 1.1rem; letter-spacing: .06em; }
+
+/* answers are full sentences, so stack them rather than sitting them in a row */
+.options { display: flex; flex-direction: column; gap: .5rem; margin-top: 1.2rem; }
+.option {
+  text-align: left; padding: .6rem .8rem; line-height: 1.4;
+  white-space: normal; background: var(--surface-2);
+}
+.option:disabled { opacity: 1; }            /* keep the right answer readable */
+.option.right { border-color: var(--green-fg); background: var(--green-bg); color: var(--green-fg); }
+.option.wrong { border-color: var(--danger); background: #3a1f1e; color: #ffb3b0; }
+
+.verdict { margin: 1rem 0 .6rem; font-size: .9rem; }
+.verdict.right { color: var(--green-fg); }
+.verdict.wrong { color: #ffb3b0; }
+
+.muted { color: var(--text-faint); font-size: .85rem; }
+code {
+  background: var(--surface-2); padding: .05rem .3rem;
+  border-radius: 3px; font-size: .9em; color: var(--text-dim);
+}
+a { color: var(--accent); }
+::placeholder { color: var(--text-faint); }
