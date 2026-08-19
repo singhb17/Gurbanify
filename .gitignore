@@ -23,6 +23,12 @@ data/
 # summaries. compare.html is written by compare.py out of the same cache.
 search/cache/vectors.pkl
 search/out/
+search/index.log
+search/.index.lock
+
+# BLOB dumps written by SQLite viewer extensions when you click an embedding.
+# Each is a copy of one vector that is already in the database.
+*-embedding.bin
 
 # NOT ignored, on purpose: search/cache/summaries/*.json. Those are the
 # LLM summaries the bench paid for -- deleting them costs real money to

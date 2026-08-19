@@ -1,8 +1,12 @@
-"""Turn text into vectors with BGE-M3, and write them into shabads.db.
+"""Turn text into vectors with BGE-M3.
 
-    python embed.py --field translation_en --limit 50   # dry-ish: embed a few
-    python embed.py --field summary                     # the real one, later
-    python embed.py --stats
+    python embed.py --stats        # how much of the library is indexed
+
+This is the model-loading half of the pipeline: load_model, embed_texts and
+pack/unpack live here and are imported by index_library.py, bench.py and
+test_clustering.py. Writing vectors into the database is index_library.py's
+job -- it is per-model, checkpointed and resumable, which the old --field CLI
+in this file was not.
 
 A one-time script, deliberately NOT a service (CLAUDE.md §7). The web app never
 loads the model; it only ever reads vectors that are already in the database.
@@ -26,11 +30,6 @@ DB_PATH = os.path.join(ROOT, "shabads.db")
 
 MODEL_NAME = "BAAI/bge-m3"
 DIMS = 1024
-
-# Which column feeds the embedding. summary is the eventual answer (§6), the
-# others exist so the §15 sanity check can compare them against each other.
-FIELDS = ("summary", "translation_en", "gurmukhi", "teeka_pa")
-
 
 def pack(vec):
     """float32 little-endian, so it round-trips identically anywhere."""
@@ -62,52 +61,22 @@ def embed_texts(model, texts, batch=8):
 
 
 def main():
+    """Coverage only. Everything that writes is in index_library.py."""
     ap = argparse.ArgumentParser()
-    ap.add_argument("--field", default="summary", choices=FIELDS,
-                    help="which column to embed")
-    ap.add_argument("--limit", type=int, default=0, help="0 = everything")
-    ap.add_argument("--redo", action="store_true",
-                    help="re-embed rows that already have a vector")
-    ap.add_argument("--stats", action="store_true", help="just report coverage")
-    args = ap.parse_args()
+    ap.add_argument("--stats", action="store_true", help="report coverage")
+    ap.parse_args()
 
-    conn = sqlite3.connect(DB_PATH)
+    conn = sqlite3.connect(f"file:{DB_PATH}?mode=ro", uri=True)
     conn.row_factory = sqlite3.Row
-
-    if args.stats:
-        total = conn.execute("SELECT COUNT(*) FROM lines").fetchone()[0]
-        done = conn.execute(
-            "SELECT COUNT(*) FROM lines WHERE embedding IS NOT NULL").fetchone()[0]
-        summ = conn.execute(
-            "SELECT COUNT(*) FROM lines WHERE summary IS NOT NULL AND summary <> ''"
-        ).fetchone()[0]
-        print(f"lines      {total}")
-        print(f"summarised {summ}")
-        print(f"embedded   {done}")
-        conn.close()
-        return
-
-    where = f"{args.field} IS NOT NULL AND {args.field} <> ''"
-    if not args.redo:
-        where += " AND embedding IS NULL"
-    sql = f"SELECT id, {args.field} AS txt FROM lines WHERE {where} ORDER BY id"
-    if args.limit:
-        sql += f" LIMIT {args.limit}"
-
-    rows = conn.execute(sql).fetchall()
-    if not rows:
-        print("nothing to embed")
-        conn.close()
-        return
-
-    print(f"embedding {len(rows)} lines from `{args.field}`")
-    model = load_model()
-    vecs = embed_texts(model, [r["txt"] for r in rows])
-
-    with conn:
-        conn.executemany("UPDATE lines SET embedding = ? WHERE id = ?",
-                         [(pack(v.tolist()), r["id"]) for r, v in zip(rows, vecs)])
-    print(f"wrote {len(rows)} vectors of {len(vecs[0])} dims")
+    total = conn.execute("SELECT COUNT(*) FROM lines").fetchone()[0]
+    print(f"lines       {total}")
+    for r in conn.execute(
+            """SELECT model, COUNT(*) n,
+                      SUM(embedding IS NOT NULL) e
+               FROM line_summaries GROUP BY model ORDER BY model"""):
+        print(f"  {r['model']:<14}{r['n']:>6} summarised {r['e']:>6} embedded")
+    if not conn.execute("SELECT COUNT(*) FROM line_summaries").fetchone()[0]:
+        print("  (nothing indexed yet -- run index_library.py)")
     conn.close()
 
 

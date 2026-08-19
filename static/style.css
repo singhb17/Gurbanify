@@ -310,10 +310,19 @@ mark {
 .dialog-foot .spacer { flex: 1 1 auto; }
 
 .line { padding: .65rem 0; border-bottom: 1px solid var(--border); }
+/* blue: the line this shabad is filed under, the reason it is in the library */
 .line.mine {
   background: #1e2a33; border-left: 3px solid var(--accent);
   padding-left: .65rem; border-radius: 4px;
 }
+/* amber: the line you arrived for from Similar. Distinct from blue on purpose
+   -- they answer different questions and are frequently not the same line. */
+.line.came-for {
+  background: #332b18; border-left: 3px solid #d9a441;
+  padding-left: .65rem; border-radius: 4px;
+}
+/* both at once: keep the amber fill, mark the edge with both colours */
+.line.came-for.mine { border-left-color: #d9a441; box-shadow: inset 3px 0 0 var(--accent); }
 .line .en { font-size: .87rem; color: var(--text-dim); }
 .line .pa { font-size: .87rem; color: var(--text-faint); }
 .line .no {
@@ -604,15 +613,191 @@ body.deck-view { padding-bottom: 0; overflow: hidden; }
 .idx {
   display: inline-flex; align-items: center; gap: .35rem;
   margin-left: .5rem; padding: .1rem .45rem;
-  font-size: .72rem; border-radius: 3px; white-space: nowrap; cursor: default;
+  font: inherit; font-size: .72rem;
+  border: 1px solid transparent; border-radius: 3px;
+  white-space: nowrap; cursor: pointer;
 }
 .idx::before {
   content: ""; width: .45rem; height: .45rem; border-radius: 50%;
   background: currentColor; flex: 0 0 auto;
 }
+.idx:hover, .idx:focus-visible { border-color: currentColor; }
 .idx.none { background: #3a1f1e; color: #e0736e; }
 .idx.part { background: var(--orange-bg); color: var(--orange-fg); }
 .idx.done { background: var(--green-bg); color: var(--green-fg); }
+/* a fourth state, distinct from amber: work is happening this second */
+.idx.running { background: var(--blue-bg); color: var(--blue-fg); }
+.idx.running::before { animation: ix-pulse 1.1s ease-in-out infinite; }
+@keyframes ix-pulse { 0%, 100% { opacity: 1; } 50% { opacity: .25; } }
+@media (prefers-reduced-motion: reduce) {
+  .idx.running::before { animation: none; }
+}
+
+.ix-live {
+  padding: .7rem .8rem; margin-bottom: .9rem;
+  border: 1px solid var(--blue-fg); border-radius: 8px; background: var(--blue-bg);
+}
+.ix-job { margin-top: .5rem; }
+.row-between { display: flex; justify-content: space-between; gap: .6rem; }
+.ix-bar {
+  height: .35rem; margin-top: .3rem; border-radius: 3px;
+  background: rgba(255,255,255,.12); overflow: hidden;
+}
+.ix-bar span {
+  display: block; height: 100%; background: var(--blue-fg);
+  transition: width .4s ease;
+}
+
+/* ---------- indexing dialog ---------- */
+
+#index-dialog {
+  width: min(30rem, calc(100vw - 2rem)); padding: 0;
+  border: 1px solid var(--border-hi); border-radius: 12px;
+  background: var(--surface); color: var(--text);
+  box-shadow: 0 18px 50px rgba(0,0,0,.6);
+}
+#index-dialog::backdrop { background: rgba(0,0,0,.62); backdrop-filter: blur(2px); }
+#index-body { padding: 1rem; }
+.ix-list { margin-top: .8rem; }
+.ix-row {
+  display: flex; align-items: center; gap: .6rem;
+  padding: .55rem 0; border-bottom: 1px solid var(--border);
+}
+.ix-row:last-child { border-bottom: 0; }
+.ix-row.off { opacity: .5; }
+.ix-name { flex: 1 1 auto; min-width: 0; }
+.ix-nums { font-size: .8rem; white-space: nowrap; }
+.ix-row .dot {
+  width: .6rem; height: .6rem; border-radius: 50%; flex: 0 0 auto;
+}
+.dot.none { background: #e0736e; }
+.dot.part { background: var(--orange-fg); }
+.dot.done { background: var(--green-fg); }
+
+/* ---------- similar ---------- */
+
+/* The whole tuk is the target -- no button, because a row of them down the
+   side of a shabad is visual noise in the one place that should be quiet.
+   Padding is on the row so the hover tint reads as "this block is the thing
+   you are about to press". */
+.line.tappable {
+  padding: .65rem .7rem; border-radius: 6px;
+  cursor: pointer; transition: background .12s ease;
+}
+.line.tappable:hover { background: var(--surface); }
+.line.tappable:focus-visible { outline: 2px solid var(--accent); outline-offset: -2px; }
+.line.tappable::after {
+  content: "similar →"; float: right; margin-left: .6rem;
+  font-size: .68rem; color: var(--text-faint); opacity: 0;
+  transition: opacity .12s ease;
+}
+.line.tappable:hover::after { opacity: 1; }
+@media (hover: none) {                 /* on a touch screen there is no hover */
+  .line.tappable::after { opacity: .55; }
+}
+
+.sim-query {
+  padding: .9rem 1rem; margin-bottom: 1rem;
+  border: 1px solid var(--border); border-left: 3px solid var(--accent);
+  border-radius: 8px; background: var(--surface);
+}
+.sim-query .gurmukhi { font-size: 1.45rem; line-height: 1.65; }
+.sim-query .en { font-size: .95rem; color: var(--text-dim); margin-top: .35rem; }
+.sim-query .pa { font-size: .88rem; color: var(--text-faint); margin-top: .25rem; }
+.sim-query .meta { margin-top: .6rem; }
+.sim-query .meta span { margin: 0 .7rem 0 0; }
+.sim-label {
+  font-size: .7rem; text-transform: uppercase; letter-spacing: .06em;
+  color: var(--text-faint); margin-bottom: .45rem;
+}
+
+.sim-result {
+  padding: .85rem 1rem; margin-bottom: .6rem;
+  border: 1px solid var(--border); border-radius: 8px; background: var(--surface);
+}
+.sim-result.tappable { cursor: pointer; transition: border-color .12s ease; }
+.sim-result.tappable:hover { border-color: var(--border-hi); background: var(--surface-2); }
+.sim-result.tappable:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
+/* which shabad this line belongs to -- the same line the library list shows */
+.sim-from {
+  display: flex; align-items: baseline; gap: .45rem; flex-wrap: wrap;
+  margin-top: .6rem; font-size: .8rem;
+}
+.gur-sm { font-size: .95rem; color: var(--text-dim); }
+.sim-len { margin-left: auto; white-space: nowrap; }
+.tag-src {
+  padding: .05rem .4rem; border-radius: 3px; font-size: .72rem;
+  background: var(--blue-bg); color: var(--blue-fg);
+}
+/* Floated so the Gurmukhi keeps the full width and the number sits out of the
+   way. §7: always shown next to the actual tuk, never used to merge results
+   away -- whether two lines truly connect is a judgement, not a threshold. */
+.sim-score {
+  float: right; margin: .1rem 0 .3rem .7rem;
+  padding: .1rem .4rem; border-radius: 4px;
+  font-family: ui-monospace, "SF Mono", Menlo, monospace; font-size: .72rem;
+  color: var(--text-dim); background: var(--surface-2);
+}
+.sim-result .gurmukhi { font-size: 1.15rem; line-height: 1.6; }
+.sim-result .en { font-size: .87rem; color: var(--text-dim); margin-top: .3rem; }
+.sim-result .pa { font-size: .85rem; color: var(--text-faint); margin-top: .2rem; }
+/* a judged card stays visibly judged, so a long list shows what is left to do */
+.sim-result.voted-up   { border-left: 3px solid var(--green-fg); }
+.sim-result.voted-down { border-left: 3px solid var(--danger); opacity: .6; }
+.sim-foot {
+  display: flex; align-items: center; gap: .5rem;
+  margin-top: .7rem; padding-top: .6rem; flex-wrap: wrap;
+  border-top: 1px solid var(--border);
+}
+.vote {
+  padding: .15rem .6rem; font-size: .95rem; line-height: 1.4;
+  background: transparent; border: 1px solid var(--border);
+  border-radius: 6px; cursor: pointer; filter: grayscale(1); opacity: .65;
+}
+.vote:hover { border-color: var(--border-hi); filter: none; opacity: 1; }
+.vote.on { filter: none; opacity: 1; }
+.vote.up.on   { border-color: var(--green-fg); background: var(--green-bg); }
+.vote.down.on { border-color: var(--danger);   background: #3a1f1e; }
+.sim-foot .who {
+  margin-left: auto; font-size: .72rem; color: var(--text-faint);
+  font-family: ui-monospace, "SF Mono", Menlo, monospace;
+}
+
+/* ---------- settings ---------- */
+
+.panel {
+  background: var(--surface); border: 1px solid var(--border);
+  border-radius: 10px; padding: 1rem; margin-bottom: 1rem;
+}
+.panel h3 { margin: 0 0 .4rem; font-size: .9rem; font-weight: 600; }
+.panel .muted { font-size: .82rem; }
+.set-row {
+  display: flex; align-items: center; gap: .7rem;
+  padding: .6rem 0; border-bottom: 1px solid var(--border); cursor: pointer;
+}
+.set-row:last-child { border-bottom: 0; }
+.mono { font-family: ui-monospace, "SF Mono", Menlo, monospace; font-size: .75rem; }
+
+table.scores { border-collapse: collapse; width: 100%; margin-top: .6rem; }
+table.scores th, table.scores td {
+  text-align: right; padding: .4rem .5rem; border-bottom: 1px solid var(--border);
+  font-size: .85rem;
+}
+table.scores th { color: var(--text-dim); font-weight: 600; }
+table.scores th:first-child, table.scores td:first-child { text-align: left; }
+table.scores tr.off { opacity: .45; }
+
+.empty-state {
+  padding: 1.4rem; text-align: center;
+  border: 1px dashed var(--border-hi); border-radius: 10px; margin-top: .6rem;
+}
+.empty-state p { margin: .3rem 0; }
+.empty-state code {
+  background: var(--surface-2); padding: .05rem .3rem; border-radius: 3px;
+  font-size: .85em;
+}
+
+.gear { font-size: 1.05rem; line-height: 1; padding: .3rem .55rem; }
 
 .practice-bar {
   position: sticky; top: var(--header-h, 3.4rem); z-index: 9;

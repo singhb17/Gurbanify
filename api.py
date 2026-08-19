@@ -12,10 +12,13 @@ Two SQLite files, deliberately separate (CLAUDE.md §5):
 Docker is NOT needed to run this; it's only needed to rebuild banidb.db.
 """
 
+import datetime
 import os
 import random
 import re
 import sqlite3
+import subprocess
+import sys
 from typing import List, Optional
 
 from fastapi import FastAPI, HTTPException, Query
@@ -27,10 +30,25 @@ HERE = os.path.dirname(os.path.abspath(__file__))
 LIBRARY_DB = os.path.join(HERE, "shabads.db")
 CORPUS_DB = os.path.join(HERE, "banidb.db")
 STATIC_DIR = os.path.join(HERE, "static")
+# Where a detached indexing child writes. Without this its output goes nowhere
+# and a crash on startup is invisible from both the app and the terminal.
+INDEX_LOG = os.path.join(HERE, "search", "index.log")
 
 app = FastAPI(title="Shabad Library")
 
 TAG_KINDS = ("genre", "speed")
+
+# The two summariser models the bench in search/ settled on: gemini37 led every
+# topic set, and deepseeknt was the best non-Google option once its reasoning was
+# turned off (which made it both cheaper AND better). Two, not three -- a third
+# means ~40 results to judge per query instead of ~25, which is the difference
+# between a habit and a chore. Adding one later is an INSERT, not a migration.
+DEFAULT_MODELS = (
+    ("gemini37", "Gemini 3.7 Flash"),
+    ("deepseeknt", "DeepSeek v4 Pro"),
+)
+
+SIMILAR_LIMIT = 20          # §3: about twenty results, ranked, never thresholded
 
 
 @app.on_event("startup")
@@ -85,6 +103,72 @@ def ensure_deck_schema():
             conn.execute("CREATE INDEX IF NOT EXISTS idx_learning_due ON learning_lines(due)")
             conn.execute(
                 "CREATE INDEX IF NOT EXISTS idx_learning_shabad ON learning_lines(shabad_id)")
+
+            # --- similarity search + model comparison (CLAUDE.md §3) ---
+            conn.execute("""
+                CREATE TABLE IF NOT EXISTS models (
+                  name        TEXT PRIMARY KEY,
+                  label       TEXT NOT NULL,
+                  enabled     INTEGER NOT NULL DEFAULT 1,
+                  sort_order  INTEGER NOT NULL DEFAULT 0
+                )""")
+            conn.execute("""
+                CREATE TABLE IF NOT EXISTS line_summaries (
+                  model       TEXT NOT NULL,
+                  line_id     INTEGER NOT NULL REFERENCES lines(id) ON DELETE CASCADE,
+                  summary     TEXT NOT NULL,
+                  embedding   BLOB,
+                  prompt_ver  TEXT NOT NULL DEFAULT '',
+                  created_at  TEXT NOT NULL DEFAULT (datetime('now')),
+                  PRIMARY KEY (model, line_id)
+                ) WITHOUT ROWID""")
+            conn.execute("""
+                CREATE TABLE IF NOT EXISTS line_relations (
+                  query_line_id   INTEGER NOT NULL REFERENCES lines(id) ON DELETE CASCADE,
+                  result_line_id  INTEGER NOT NULL REFERENCES lines(id) ON DELETE CASCADE,
+                  verdict         INTEGER NOT NULL,
+                  judged_at       TEXT NOT NULL DEFAULT (datetime('now')),
+                  PRIMARY KEY (query_line_id, result_line_id)
+                )""")
+            conn.execute("""
+                CREATE TABLE IF NOT EXISTS model_results (
+                  query_line_id   INTEGER NOT NULL REFERENCES lines(id) ON DELETE CASCADE,
+                  result_line_id  INTEGER NOT NULL REFERENCES lines(id) ON DELETE CASCADE,
+                  model           TEXT NOT NULL,
+                  rank            INTEGER NOT NULL,
+                  prompt_ver      TEXT NOT NULL DEFAULT '',
+                  PRIMARY KEY (query_line_id, result_line_id, model)
+                )""")
+            conn.execute("""
+                CREATE TABLE IF NOT EXISTS settings (
+                  key    TEXT PRIMARY KEY,
+                  value  TEXT NOT NULL
+                )""")
+            conn.execute("""
+                CREATE TABLE IF NOT EXISTS index_jobs (
+                  id          INTEGER PRIMARY KEY,
+                  model       TEXT NOT NULL,
+                  state       TEXT NOT NULL,
+                  phase       TEXT,
+                  total       INTEGER NOT NULL DEFAULT 0,
+                  done        INTEGER NOT NULL DEFAULT 0,
+                  spent       REAL    NOT NULL DEFAULT 0,
+                  error       TEXT,
+                  started_at  TEXT NOT NULL DEFAULT (datetime('now')),
+                  updated_at  TEXT NOT NULL DEFAULT (datetime('now'))
+                )""")
+            conn.execute("CREATE INDEX IF NOT EXISTS idx_index_jobs_state "
+                         "ON index_jobs(state, updated_at)")
+            conn.execute(
+                "CREATE INDEX IF NOT EXISTS idx_relations_result ON line_relations(result_line_id)")
+            conn.execute(
+                "CREATE INDEX IF NOT EXISTS idx_model_results_model ON model_results(model)")
+
+            # Seed the two models chosen by the bench in search/. INSERT OR IGNORE
+            # so re-running never clobbers an `enabled` flag toggled in Settings.
+            for i, (name, label) in enumerate(DEFAULT_MODELS):
+                conn.execute("INSERT OR IGNORE INTO models (name, label, sort_order) "
+                             "VALUES (?, ?, ?)", (name, label, i))
     finally:
         conn.close()
 
@@ -136,6 +220,164 @@ def corpus():
     conn = sqlite3.connect(f"file:{CORPUS_DB}?mode=ro", uri=True)
     conn.row_factory = sqlite3.Row
     return conn
+
+
+def model_rows(conn):
+    return [dict(r) for r in conn.execute(
+        "SELECT name, label, enabled, sort_order FROM models ORDER BY sort_order, name")]
+
+
+DEFAULT_SETTINGS = {"auto_index": "1"}
+
+# The most an automatic background pass may spend in one go. A shabad averages
+# ten lines, about a cent, so this covers a normal add many times over while
+# making it impossible for adding one shabad to start a multi-dollar run over a
+# backlog. Clearing a backlog is a manual decision, taken with the price on
+# screen.
+AUTO_INDEX_BUDGET = 0.25
+
+
+def get_setting(conn, key):
+    row = conn.execute("SELECT value FROM settings WHERE key = ?", (key,)).fetchone()
+    return row["value"] if row else DEFAULT_SETTINGS.get(key)
+
+
+def spawn_indexer():
+    """Kick off an indexing pass in a DETACHED child process.
+
+    Deliberately a subprocess and not a thread: BGE-M3 wants ~3 GB while it
+    runs, and CLAUDE.md §7 is explicit that the web app never loads the model.
+    A child process honours that -- the memory belongs to something that exits,
+    so the server goes back to its normal footprint the moment indexing ends.
+
+    Fire and forget. Adding a shabad must never wait on OpenRouter, and must
+    never fail because indexing did: the shabad is already saved by this point,
+    and an unindexed one is merely un-searchable, which the badge says out loud.
+
+    Running several at once is prevented by the lock inside the script, not
+    here. That lock is also what makes this safe to call on every add: the
+    process that wins it asks the database what still needs doing, so it picks
+    up the shabads that arrived while it was working.
+
+    --max-spend is the other half of that safety. The script's normal job is
+    "index everything outstanding", so without a ceiling, adding one shabad
+    while a backlog exists would quietly spend several dollars. A background run
+    is allowed small change and no more; clearing a backlog stays something you
+    choose to do, having seen the price.
+
+    Output goes to a log file, NOT to DEVNULL. A detached child that dies on
+    startup -- a missing key, a bad import, a locked database -- leaves no trace
+    otherwise, and "I added a shabad and nothing happened" becomes impossible to
+    diagnose from inside the app. The log is the only place that failure can be
+    seen, so it has to exist.
+    """
+    script = os.path.join(HERE, "search", "index_library.py")
+    if not os.path.exists(script):
+        return
+    kw = {}
+    if os.name == "nt":
+        # no console window, and survives the server being closed
+        kw["creationflags"] = (subprocess.CREATE_NO_WINDOW
+                               | subprocess.DETACHED_PROCESS)
+    else:
+        kw["start_new_session"] = True
+    try:
+        log = open(INDEX_LOG, "a", encoding="utf-8", errors="replace")
+        log.write(f"\n=== spawn {datetime.datetime.now():%Y-%m-%d %H:%M:%S} "
+                  f"(python: {sys.executable}) ===\n")
+        log.flush()
+        subprocess.Popen([sys.executable, "-u", script, "--yes",
+                          "--max-spend", str(AUTO_INDEX_BUDGET)],
+                         cwd=HERE, stdout=log, stderr=subprocess.STDOUT,
+                         stdin=subprocess.DEVNULL, **kw)
+    except Exception as e:                 # never let this break adding a shabad
+        print(f"auto-index could not start: {e}")
+        try:
+            with open(INDEX_LOG, "a", encoding="utf-8") as f:
+                f.write(f"spawn failed: {type(e).__name__}: {e}\n")
+        except OSError:
+            pass
+
+
+def live_jobs(conn):
+    """Jobs genuinely in flight right now.
+
+    `state = 'running'` alone is not enough: a killed process never writes a
+    final state, so the row would claim to be indexing forever. The heartbeat in
+    updated_at is the real signal, and anything silent for ten minutes is
+    treated as gone. The indexer sweeps those rows on its next start; this only
+    has to avoid believing them meanwhile.
+    """
+    return [dict(r) for r in conn.execute(
+        """SELECT id, model, state, phase, total, done, spent, started_at, updated_at
+           FROM index_jobs
+           WHERE state = 'running'
+             AND updated_at >= datetime('now', '-10 minutes')
+           ORDER BY id""")]
+
+
+def recent_jobs(conn, limit=5):
+    return [dict(r) for r in conn.execute(
+        "SELECT id, model, state, phase, total, done, spent, error, "
+        "started_at, updated_at FROM index_jobs ORDER BY id DESC LIMIT ?", (limit,))]
+
+
+def indexing_status(conn, shabad_id):
+    """How far the derived layer (CLAUDE.md §5) has got, per model.
+
+    Three states, per model and overall:
+        none  no line indexed at all
+        part  some lines done, or some models done and others not
+        done  every line summarised AND embedded
+
+    Only ENABLED models decide the overall state. A model switched off in
+    Settings would otherwise hold the badge amber forever, which reads as "still
+    working" when the truth is "deliberately not doing that one". Disabled
+    models are still listed, so the popup shows the whole picture.
+
+    A line counts as done only when it has both a summary and a vector: a
+    summary with no embedding is invisible to search, so calling it indexed
+    would be a lie in exactly the case that matters.
+    """
+    total = conn.execute("SELECT COUNT(*) FROM lines WHERE shabad_id = ?",
+                         (shabad_id,)).fetchone()[0]
+    if not total:
+        return None
+
+    counts = {r["model"]: r for r in conn.execute(
+        """SELECT ls.model,
+                  SUM(CASE WHEN ls.summary <> '' THEN 1 ELSE 0 END)     AS summarised,
+                  SUM(CASE WHEN ls.embedding IS NOT NULL THEN 1 ELSE 0 END) AS embedded
+           FROM line_summaries ls
+           JOIN lines l ON l.id = ls.line_id
+           WHERE l.shabad_id = ?
+           GROUP BY ls.model""", (shabad_id,))}
+
+    models = []
+    for m in model_rows(conn):
+        c = counts.get(m["name"])
+        summarised = (c["summarised"] if c else 0) or 0
+        embedded = (c["embedded"] if c else 0) or 0
+        done = min(summarised, embedded)
+        models.append({**m, "summarised": summarised, "embedded": embedded,
+                       "total": total,
+                       "state": "done" if done >= total else "part" if done else "none"})
+
+    enabled = [m for m in models if m["enabled"]]
+    if enabled and all(m["state"] == "done" for m in enabled):
+        overall = "done"
+    elif any(m["state"] != "none" for m in enabled):
+        overall = "part"
+    else:
+        overall = "none"
+
+    # A run in flight outranks the count. "Half done and working on it" and
+    # "half done and abandoned" are the same number but not the same situation,
+    # and only one of them is worth waiting for.
+    jobs = live_jobs(conn)
+    if jobs and overall != "done":
+        overall = "running"
+    return {"total": total, "state": overall, "models": models, "jobs": jobs}
 
 
 def letters_clause(column, q):
@@ -382,7 +624,10 @@ def list_shabads(
         hits = {}
         if cond:
             for l in conn.execute(
-                f"""SELECT shabad_id, line_no, gurmukhi, translation_en, first_letters
+                # id comes along so the card can open the shabad ON the matched
+                # line rather than dropping you at the line it is filed under
+                f"""SELECT id AS line_id, shabad_id, line_no, gurmukhi,
+                           translation_en, first_letters
                     FROM lines l WHERE l.shabad_id IN ({placeholders}) AND ({cond})
                     ORDER BY shabad_id, line_no""", [*ids, *cargs]):
                 hits.setdefault(l["shabad_id"], dict(l))
@@ -418,11 +663,7 @@ def get_shabad(shabad_id: int):
     # How far the derived layer (CLAUDE.md §5) has got for this shabad. Reads
     # zero for everything until the summary/embedding pipeline exists, which is
     # exactly what makes it a useful progress indicator for that work.
-    ix = conn.execute(
-        """SELECT COUNT(*) total,
-                  SUM(CASE WHEN summary IS NOT NULL AND summary <> '' THEN 1 ELSE 0 END) summarised,
-                  SUM(CASE WHEN embedding IS NOT NULL THEN 1 ELSE 0 END) embedded
-           FROM lines WHERE shabad_id = ?""", (shabad_id,)).fetchone()
+    ix = indexing_status(conn, shabad_id)
     conn.close()
     out = dict(row)
     out["lines"] = [{k: v for k, v in l.items() if k != "embedding"} for l in lines]
@@ -431,8 +672,7 @@ def get_shabad(shabad_id: int):
     out["learning"] = lrn is not None
     out["learning_progress"] = prog
     out["learning_stage"] = stage_name(prog, lrn["rahao_ok"]) if lrn else None
-    out["indexing"] = {"total": ix["total"], "summarised": ix["summarised"] or 0,
-                       "embedded": ix["embedded"] or 0}
+    out["indexing"] = ix
     return out
 
 
@@ -495,9 +735,13 @@ def add_shabad(body: ShabadCreate):
                 [(new_id, kind, val)
                  for kind, vals in (("genre", body.genre), ("speed", body.speed))
                  for val in (vals or ["Not chosen"])])
+        auto = get_setting(conn, "auto_index") == "1"
     finally:
         conn.close()
-    return {"id": new_id, "lines": len(verses)}
+    # after the connection is closed, so the child never contends for the write
+    if auto:
+        spawn_indexer()
+    return {"id": new_id, "lines": len(verses), "indexing_started": auto}
 
 
 @app.patch("/api/shabads/{shabad_id}")
@@ -1262,6 +1506,280 @@ def preview(banidb_shabad_id: int):
 
 
 # --- static -----------------------------------------------------------------
+
+# --- similarity search + model comparison ------------------------------------
+#
+# Nothing here calls a model. Every vector it reads was written by the indexing
+# pass in search/, so a query is arithmetic over numbers already on disk
+# (CLAUDE.md §7). Until that pass has run, these endpoints correctly return
+# nothing, and say why rather than returning a bare empty list.
+
+class Relation(BaseModel):
+    query_line_id: int
+    result_line_id: int
+    verdict: int                       # +1 connected, -1 unrelated, 0 clears
+
+
+class ModelPatch(BaseModel):
+    enabled: bool
+
+
+# model -> (count_at_load, [line_id], matrix). 5,223 x 1024 float32 is ~21 MB
+# per model, far too much to read per request, so it is held in memory.
+# Invalidated by row count, which catches new rows; the indexing pass must call
+# clear_vector_cache() itself if it ever REPLACES vectors in place.
+_VECTORS = {}
+
+
+def clear_vector_cache():
+    _VECTORS.clear()
+
+
+def _vectors_for(conn, model):
+    n = conn.execute("SELECT COUNT(*) FROM line_summaries "
+                     "WHERE model = ? AND embedding IS NOT NULL", (model,)).fetchone()[0]
+    hit = _VECTORS.get(model)
+    if hit and hit[0] == n:
+        return hit[1], hit[2]
+    if not n:
+        return [], None
+
+    import numpy as np
+    rows = conn.execute("SELECT line_id, embedding FROM line_summaries "
+                        "WHERE model = ? AND embedding IS NOT NULL "
+                        "ORDER BY line_id", (model,)).fetchall()
+    ids = [r["line_id"] for r in rows]
+    mat = np.frombuffer(b"".join(r["embedding"] for r in rows),
+                        dtype="<f4").reshape(len(ids), -1)
+    # normalised once here, so every query is a plain dot product
+    mat = mat / np.linalg.norm(mat, axis=1, keepdims=True)
+    _VECTORS[model] = (n, ids, mat)
+    return ids, mat
+
+
+def similar_for_model(conn, model, line_id, limit):
+    """The `limit` nearest lines to `line_id` under one model, best first.
+
+    §7: RANK, never threshold. In 1024 dimensions unrelated vectors sit near
+    perpendicular, so real scores bunch in a narrow band -- a hardcoded cutoff
+    like `sim > 0.8` returns nothing at all. Sort and take the top N.
+    """
+    ids, mat = _vectors_for(conn, model)
+    if mat is None or line_id not in ids:
+        return []
+    import numpy as np
+    i = ids.index(line_id)
+    sims = mat @ mat[i]
+    sims[i] = -9                                   # never match a line to itself
+    order = np.argsort(-sims)[:limit]
+    return [(ids[j], float(sims[j])) for j in order]
+
+
+class SettingPatch(BaseModel):
+    value: str
+
+
+@app.get("/api/indexing")
+def get_indexing():
+    """What the indexer is doing, for the badge to poll while a run is live."""
+    conn = library()
+    try:
+        return {"running": live_jobs(conn), "recent": recent_jobs(conn)}
+    finally:
+        conn.close()
+
+
+@app.get("/api/settings")
+def list_settings():
+    conn = library()
+    try:
+        stored = {r["key"]: r["value"] for r in conn.execute("SELECT key, value FROM settings")}
+        return {"settings": {**DEFAULT_SETTINGS, **stored}}
+    finally:
+        conn.close()
+
+
+@app.patch("/api/settings/{key}")
+def patch_setting(key: str, body: SettingPatch):
+    if key not in DEFAULT_SETTINGS:
+        raise HTTPException(404, f"no setting named {key}")
+    conn = library(write=True)
+    try:
+        with conn:
+            conn.execute("INSERT INTO settings (key, value) VALUES (?,?) "
+                         "ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+                         (key, body.value))
+        return {"key": key, "value": body.value}
+    finally:
+        conn.close()
+
+
+@app.get("/api/models")
+def list_models():
+    conn = library()
+    try:
+        return {"models": model_rows(conn)}
+    finally:
+        conn.close()
+
+
+@app.patch("/api/models/{name}")
+def patch_model(name: str, body: ModelPatch):
+    conn = library(write=True)
+    try:
+        with conn:
+            n = conn.execute("UPDATE models SET enabled = ? WHERE name = ?",
+                             (1 if body.enabled else 0, name)).rowcount
+        if not n:
+            raise HTTPException(404, f"no model named {name}")
+        return {"name": name, "enabled": body.enabled}
+    finally:
+        conn.close()
+
+
+@app.get("/api/similar/{line_id}")
+def get_similar(line_id: int, limit: int = SIMILAR_LIMIT):
+    """Lines related in meaning to this one, merged across enabled models.
+
+    One row per RESULT LINE, never one per model: a line three models returned
+    is shown once and judged once, and every model that offered it shares the
+    verdict. `by` carries each model's rank so credit can be weighted by how
+    prominently it was offered.
+
+    Sorted by score, descending (§3) -- best match at the top, where it belongs.
+    Blindness is kept by hiding WHICH model said what, not by scrambling the
+    order: a list in random order is useless for the thing this page is actually
+    for, which is finding the related line.
+
+    Caveat worth knowing: scores from different models are not strictly
+    comparable. Every vector comes from BGE-M3, but each model's summaries have
+    their own style, and a model that writes more uniformly will score its own
+    matches higher across the board. So 0.99 from one model and 0.89 from
+    another does not reliably mean the first match is better. If that starts to
+    skew the list, sort on best RANK instead -- a #1 is a #1 whoever said it.
+    """
+    conn = library(write=True)      # writes model_results: a record of what was shown
+    try:
+        q = conn.execute(
+            """SELECT l.id, l.gurmukhi, l.translation_en, l.teeka_pa, l.line_no,
+                      s.id AS shabad_id, s.source_line, s.raag_en, s.writer, s.ang
+               FROM lines l JOIN shabads s ON s.id = l.shabad_id
+               WHERE l.id = ?""", (line_id,)).fetchone()
+        if not q:
+            raise HTTPException(404, "no such line")
+
+        models = [m for m in model_rows(conn) if m["enabled"]]
+        merged = {}
+        for m in models:
+            for rank, (rid, score) in enumerate(
+                    similar_for_model(conn, m["name"], line_id, limit)):
+                merged.setdefault(rid, {})[m["name"]] = {"rank": rank, "score": score}
+
+        if not merged:
+            return {"query": dict(q), "results": [], "models": models,
+                    "reason": "not indexed yet"}
+
+        rows = {r["id"]: dict(r) for r in conn.execute(
+            f"""SELECT l.id, l.gurmukhi, l.translation_en, l.teeka_pa, l.line_no,
+                       s.id AS shabad_id, s.source_line, s.source_line_no,
+                       s.raag_en, s.writer, s.ang,
+                       (SELECT COUNT(*) FROM lines x WHERE x.shabad_id = s.id)
+                         AS line_count
+                FROM lines l JOIN shabads s ON s.id = l.shabad_id
+                WHERE l.id IN ({','.join('?' * len(merged))})""", tuple(merged))}
+
+        verdicts = {r["result_line_id"]: r["verdict"] for r in conn.execute(
+            "SELECT result_line_id, verdict FROM line_relations WHERE query_line_id = ?",
+            (line_id,))}
+
+        with conn:
+            conn.executemany(
+                "INSERT OR REPLACE INTO model_results "
+                "(query_line_id, result_line_id, model, rank) VALUES (?,?,?,?)",
+                [(line_id, rid, name, d["rank"])
+                 for rid, by in merged.items() for name, d in by.items()])
+
+        results = [{**rows[rid], "by": by, "verdict": verdicts.get(rid, 0),
+                    "score": max(v["score"] for v in by.values()),
+                    "best_rank": min(v["rank"] for v in by.values())}
+                   for rid, by in merged.items() if rid in rows]
+        results.sort(key=lambda r: (-r["score"], r["best_rank"]))
+        return {"query": dict(q), "results": results, "models": models, "reason": None}
+    finally:
+        conn.close()
+
+
+@app.post("/api/relations")
+def post_relation(body: Relation):
+    """Record a judgement. verdict 0 deletes it, so a mis-tap is undoable."""
+    conn = library(write=True)
+    try:
+        with conn:
+            if body.verdict == 0:
+                conn.execute("DELETE FROM line_relations "
+                             "WHERE query_line_id = ? AND result_line_id = ?",
+                             (body.query_line_id, body.result_line_id))
+            else:
+                conn.execute(
+                    """INSERT INTO line_relations (query_line_id, result_line_id, verdict)
+                       VALUES (?,?,?)
+                       ON CONFLICT(query_line_id, result_line_id)
+                       DO UPDATE SET verdict = excluded.verdict,
+                                     judged_at = datetime('now')""",
+                    (body.query_line_id, body.result_line_id,
+                     1 if body.verdict > 0 else -1))
+        return {"ok": True, "verdict": body.verdict}
+    finally:
+        conn.close()
+
+
+@app.get("/api/scores")
+def get_scores():
+    """Per-model tallies from my votes, discounted by how prominently each
+    model offered the line.
+
+    credit = verdict / log2(rank + 2). A hit at #2 is worth about 2.7x one at
+    #19 -- a plain 1/rank would say 9.5x, which over-punishes a result that is
+    merely a bit further down a list I read all of anyway.
+
+    `unique` counts only results no other enabled model offered. A line every
+    model returned separates nobody; the uniques are the entire signal.
+    """
+    import math
+    conn = library()
+    try:
+        models = model_rows(conn)
+        offers = {}
+        for r in conn.execute("SELECT query_line_id, result_line_id, model, rank "
+                              "FROM model_results"):
+            offers.setdefault((r["query_line_id"], r["result_line_id"]), []).append(
+                (r["model"], r["rank"]))
+        votes = {(r["query_line_id"], r["result_line_id"]): r["verdict"]
+                 for r in conn.execute(
+                     "SELECT query_line_id, result_line_id, verdict FROM line_relations")}
+
+        stats = {m["name"]: {**m, "up": 0, "down": 0, "dcg": 0.0, "ideal": 0.0,
+                             "unique_up": 0, "unique_down": 0} for m in models}
+        for key, verdict in votes.items():
+            for name, rank in offers.get(key, []):
+                s = stats.get(name)
+                if not s:
+                    continue                      # a model dropped from the registry
+                w = 1.0 / math.log2(rank + 2)
+                s["dcg"] += verdict * w
+                s["ideal"] += w
+                s["up" if verdict > 0 else "down"] += 1
+                if len(offers[key]) == 1:
+                    s["unique_up" if verdict > 0 else "unique_down"] += 1
+
+        out = []
+        for s in stats.values():
+            out.append({**s, "score": (s["dcg"] / s["ideal"]) if s["ideal"] else None})
+        out.sort(key=lambda s: (s["score"] is None, -(s["score"] or 0)))
+        return {"models": out, "votes": len(votes)}
+    finally:
+        conn.close()
+
 
 ASSET_RE = re.compile(r"/static/([\w.\-]+\.(?:js|css))")
 

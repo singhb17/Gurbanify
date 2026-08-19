@@ -131,7 +131,8 @@ const json = (method, body) => ({
   method, headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body),
 });
 
-const VIEWS = ['list', 'detail', 'deck', 'saved', 'learn', 'practice', 'history', 'add'];
+const VIEWS = ['list', 'detail', 'deck', 'saved', 'learn', 'practice', 'history', 'add',
+               'similar', 'settings'];
 
 // The deck sizes itself to the window, so it needs the header's real height.
 // Hardcoding it would be wrong on one screen or the other: the nav wraps onto a
@@ -145,7 +146,8 @@ function show(view) {
   for (const v of VIEWS) $('view-' + v).hidden = v !== view;
   for (const [btn, v] of [['nav-list', 'list'], ['nav-deck', 'deck'],
                           ['nav-saved', 'saved'], ['nav-learn', 'learn'],
-                          ['nav-history', 'history'], ['nav-add', 'add']])
+                          ['nav-history', 'history'], ['nav-add', 'add'],
+                          ['nav-settings', 'settings']])
     $(btn).classList.toggle('active', view === v);
   // stops the page itself scrolling behind the deck -- the card scrolls instead
   document.body.classList.toggle('deck-view', view === 'deck');
@@ -221,10 +223,16 @@ async function loadList() {
   filterParams(state.filters, p);
 
   const data = await api('/api/shabads?' + p);
+  listLoaded = true;
   $('count').textContent = `${data.count} of ${state.options.total}`;
 
   $('list').innerHTML = data.shabads.length ? data.shabads.map((s) => `
-    <div class="card" data-id="${s.id}">
+    <div class="card" data-id="${s.id}"${
+      // A search hit on an inner line should open there, highlighted, not at
+      // the line the shabad happens to be filed under. Only when the match IS
+      // a different line -- otherwise the normal blue highlight already says it.
+      s.match && s.match.line_no !== s.source_line_no
+        ? ` data-line="${s.match.line_id}"` : ''}>
       <div class="card-main">
         ${s.match ? `
         <div class="gurmukhi">${hi(s.match.gurmukhi, s.match.first_letters)}</div>
@@ -259,7 +267,8 @@ async function loadList() {
     const heart = e.target.closest('.heart');
     if (heart) { e.stopPropagation(); toggleShortlist(heart); return; }
     const card = e.target.closest('.card');
-    if (card) go('detail', { id: card.dataset.id });
+    // data-line is only set when the hit was on some other line of the shabad
+    if (card) go('detail', { id: card.dataset.id, line: card.dataset.line });
   };
 
   const jump = $('go-search-banidb');
@@ -304,7 +313,7 @@ function sttmUrl(s, mine) {
 
 // Read-only view. Everything editable now lives in the dialog, so opening a
 // shabad goes straight to the Gurbani instead of a form.
-function detailBody(s) {
+function detailBody(s, focusLineId) {
   return `
     <div class="hero">
       <div class="tags-row">
@@ -320,14 +329,22 @@ function detailBody(s) {
     </div>
 
     <div class="all-lines">
-      ${s.lines.map((l) => `
-        <div class="line ${l.line_no === s.source_line_no ? 'mine' : ''}"
-             ${l.line_no === s.source_line_no ? 'id="focus-line"' : ''}>
+      ${s.lines.map((l) => {
+        // blue = the line this shabad is filed under. yellow = the line you
+        // arrived for. They are usually different, and both are worth seeing.
+        const mine = l.line_no === s.source_line_no;
+        const came = focusLineId && l.id === focusLineId;
+        return `
+        <div class="line tappable ${mine ? 'mine' : ''} ${came ? 'came-for' : ''}"
+             data-line-id="${l.id}" role="button" tabindex="0"
+             title="Find lines with a similar meaning"
+             ${came ? 'id="focus-line"' : (!focusLineId && mine ? 'id="focus-line"' : '')}>
           <div class="no">${l.line_no}</div>
           <div class="gurmukhi">${esc(l.gurmukhi)}</div>
           ${l.translation_en ? `<div class="en">${esc(l.translation_en)}</div>` : ''}
           ${l.teeka_pa ? `<div class="pa">${esc(l.teeka_pa)}</div>` : ''}
-        </div>`).join('')}
+        </div>`;
+      }).join('')}
     </div>`;
 }
 
@@ -347,17 +364,41 @@ const ROUTES = {
   learn:    { path: '/learn',      load: loadLearn },
   history:  { path: '/history',    load: loadHistory },
   add:      { path: '/search',     load: () => $('s-q').focus() },
+  // Anything defined in similar.js or settings.js MUST be wrapped in an arrow.
+  // Those files load after this one, so naming the function bare here reads an
+  // undefined variable while this object literal is being built -- that throws,
+  // app.js never finishes, and every button on the page goes dead at once.
+  // Inside an arrow the name is looked up when the route runs, by which time
+  // both files have loaded.
+  settings: { path: '/settings',   load: () => loadSettings() },
   practice: { path: '/practice',   load: null },       // only entered via Start
   detail:   { path: null,          load: null },       // /shabad/<id>
+  similar:  { path: null,          load: (st) => loadSimilar(st.id) },  // /similar/<line_id>
 };
+
+// Views addressed by an id rather than a fixed path. Keeping them in one place
+// means pathFor and parsePath can't disagree about the url shape.
+const ID_ROUTES = { detail: '/shabad/', similar: '/similar/' };
+
+// Views that put themselves somewhere specific -- a shabad opens on the line
+// you came for, not at the top. Everything else starts at the top.
+const SELF_SCROLL = new Set(['detail']);
 
 let pushes = 0;               // so Back on a deep-linked page doesn't leave the app
 
-const pathFor = (view, id) => (view === 'detail' ? '/shabad/' + id : ROUTES[view].path);
+// ?line= carries which tuk to land on, so the url stays shareable and survives
+// a reload -- history state alone would be lost the moment the page reloads.
+const pathFor = (view, id, line) =>
+  (ID_ROUTES[view] ? ID_ROUTES[view] + id + (line ? '?line=' + line : '')
+                   : ROUTES[view].path);
 
-function parsePath(p) {
-  const m = p.match(/^\/shabad\/(\d+)\/?$/);
-  if (m) return { view: 'detail', id: m[1] };
+function parsePath(full) {
+  const [p, qs] = String(full).split('?');
+  const line = new URLSearchParams(qs || '').get('line');
+  for (const [view, prefix] of Object.entries(ID_ROUTES)) {
+    const m = p.match(new RegExp('^' + prefix + '(\\d+)/?$'));
+    if (m) return { view, id: m[1], ...(line ? { line } : {}) };
+  }
   const hit = Object.keys(ROUTES).find((k) => ROUTES[k].path === p.replace(/\/$/, '') || ROUTES[k].path === p);
   return { view: hit || 'list' };
 }
@@ -370,26 +411,45 @@ function stashScroll() {
 function go(view, opts = {}) {
   stashScroll();
   const st = { view, ...opts };
-  history.pushState(st, '', pathFor(view, opts.id));
+  history.pushState(st, '', pathFor(view, opts.id, opts.line));
   pushes += 1;
   render(st);
 }
 
+// Whether #list currently matches the server. Going Back to a list we already
+// have is then a repaint of nothing at all -- no fetch, no re-render, no jump
+// to the top and back down. Anything that changes a shabad clears it.
+let listLoaded = false;
+
 async function render(st, viaPop) {
   const view = ROUTES[st.view] ? st.view : 'list';
+  const y = st.scrollY;
   show(view);
+
+  // Returning to a list that is still good: put the page back BEFORE any await,
+  // so the restored position is the first thing painted rather than a correction
+  // half a second later.
+  const reuse = view === 'list' && viaPop && listLoaded;
+  if (reuse && y != null) window.scrollTo(0, y);
+
   if (view === 'detail') {
     // navigating history isn't opening it afresh, so don't log another visit
-    await openDetail(st.id, { silent: viaPop });
-  } else if (ROUTES[view].load) {
-    await ROUTES[view].load();
+    await openDetail(st.id, { silent: viaPop, focusLine: st.line,
+                              keepScroll: y != null });
+  } else if (!reuse && ROUTES[view].load) {
+    await ROUTES[view].load(st);        // id-addressed views read st.id
   }
-  requestAnimationFrame(() => window.scrollTo(0, st.scrollY || 0));
+
+  // A history entry carries where you were; honour it. Without one, a view that
+  // positions itself (a shabad opening on its line) is left alone, and
+  // everything else starts at the top.
+  if (y != null) window.scrollTo(0, y);
+  else if (!SELF_SCROLL.has(view)) window.scrollTo(0, 0);
 }
 
 window.addEventListener('popstate', (e) => {
   pushes = Math.max(0, pushes - 1);
-  render(e.state || parsePath(location.pathname), true);
+  render(e.state || parsePath(location.pathname + location.search), true);
 });
 
 function goBack() {
@@ -402,7 +462,10 @@ async function openDetail(id, opts = {}) {
   current = s;
   show('detail');
 
-  $('detail').innerHTML = detailBody(s);
+  // The line asked for, if any -- arriving from Similar you want the tuk that
+  // matched, which is usually not the line the shabad is filed under.
+  const focus = Number(opts.focusLine) || null;
+  $('detail').innerHTML = detailBody(s, focus);
 
   const mine = s.lines.find((l) => l.line_no === s.source_line_no) || {};
   const url = sttmUrl(s, mine);
@@ -411,14 +474,21 @@ async function openDetail(id, opts = {}) {
   paintHeart($('d-heart'), s.shortlisted);
   $('d-heart').dataset.id = s.id;
   paintLearnBtn(s.learning, s.learning_stage);
+  watchIndexing();          // no-op unless a run is actually live
 
-  // Land on the line I know the shabad by rather than the raag header, which is
-  // never the reason I saved it. Centred, so there's context above and below.
-  requestAnimationFrame(() => {
-    const focus = $('focus-line');
-    if (focus) focus.scrollIntoView({ block: 'center' });
-    else window.scrollTo(0, 0);
-  });
+  // Land on the line worth reading -- the one you arrived for, or failing that
+  // the line the shabad is filed under, never the raag header. Centred, so
+  // there's context above and below.
+  //
+  // Skipped when returning through history: there the browser position is the
+  // right answer, and jumping to the line would undo the restore.
+  if (!opts.keepScroll) {
+    requestAnimationFrame(() => {
+      const focus = $('focus-line');
+      if (focus) focus.scrollIntoView({ block: 'center' });
+      else window.scrollTo(0, 0);
+    });
+  }
 
   // fire and forget -- a failed log must never stop you reading the shabad
   if (!opts.silent) api('/api/history', json('POST', { shabad_id: Number(id) })).catch(() => {});
@@ -427,15 +497,96 @@ async function openDetail(id, opts = {}) {
 // Whether the derived layer exists for this shabad -- the LLM summary and its
 // embedding (CLAUDE.md §6/§7). It sits with ang/raag/writer rather than among
 // the buttons: it describes the shabad, it isn't something you can press.
+// A traffic light for the derived layer (CLAUDE.md §6/§7): red nothing, amber
+// partly, green every enabled model has every line. Pressable, because with
+// more than one model the single word can no longer tell the whole story --
+// the breakdown lives in a dialog rather than a tooltip a phone can't show.
+const IX_LABEL = {
+  done: 'Indexed', part: 'Partly indexed', none: 'Not indexed', running: 'Indexing…',
+};
+
 function indexBadge(ix) {
   if (!ix || !ix.total) return '';
-  const done = ix.summarised >= ix.total && ix.embedded >= ix.total;
-  const some = ix.summarised > 0 || ix.embedded > 0;
-  const cls = done ? 'done' : some ? 'part' : 'none';
-  const label = done ? 'Indexed'
-    : some ? `Partly indexed (${ix.summarised}/${ix.total})` : 'Not indexed';
-  return `<span class="idx ${cls}" title="${ix.summarised}/${ix.total} lines summarised, `
-       + `${ix.embedded}/${ix.total} embedded">${label}</span>`;
+  return `<button class="idx ${ix.state}" data-idx-badge
+            title="Which models have indexed this shabad">${IX_LABEL[ix.state]}</button>`;
+}
+
+function jobLine(j) {
+  const pct = j.total ? Math.round((j.done / j.total) * 100) : 0;
+  const what = j.phase === 'embed' ? 'building vectors' : 'writing summaries';
+  return `<div class="ix-job">
+      <div class="row-between">
+        <b>${esc(what)}</b>
+        <span class="muted">${j.done}/${j.total}${j.spent ? ` &middot; $${j.spent.toFixed(2)}` : ''}</span>
+      </div>
+      <div class="ix-bar"><span style="width:${pct}%"></span></div>
+    </div>`;
+}
+
+function openIndexDialog() {
+  const ix = current && current.indexing;
+  if (!ix) return;
+  $('index-body').innerHTML = `
+    ${(ix.jobs || []).length
+      ? `<div class="ix-live">
+           <div class="muted">Running now &mdash; this dialog updates itself.</div>
+           ${ix.jobs.map(jobLine).join('')}
+         </div>`
+      : ''}
+    <p class="muted">A line counts as done only once it has both a summary and a
+      vector &mdash; a summary with no vector is invisible to search, so calling
+      it indexed would be a lie in exactly the case that matters.</p>
+    <div class="ix-list">
+      ${ix.models.map((m) => `
+        <div class="ix-row ${m.enabled ? '' : 'off'}">
+          <span class="dot ${m.state}"></span>
+          <div class="ix-name">
+            <b>${esc(m.label)}</b>
+            ${m.enabled ? '' : '<span class="muted"> &mdash; switched off</span>'}
+          </div>
+          <div class="ix-nums muted">
+            ${Math.min(m.summarised, m.embedded)}/${m.total} lines
+          </div>
+        </div>`).join('')}
+    </div>
+    ${ix.models.some((m) => m.enabled) ? '' :
+      '<p class="muted">No model is switched on, so nothing will be indexed.</p>'}`;
+  // showModal() on an already-open dialog throws, and the poller repaints this
+  // while it is open -- so only open it if it is closed.
+  if (!$('index-dialog').open) $('index-dialog').showModal();
+}
+
+// While a run is live, re-fetch the shabad every few seconds so the badge and
+// the dialog move on their own. Indexing a shabad takes about a minute, most of
+// it the model loading in silence -- which is exactly when a static badge looks
+// like nothing is happening at all.
+let ixPoll = null;
+
+function stopIndexPoll() {
+  clearInterval(ixPoll);
+  ixPoll = null;
+}
+
+function watchIndexing() {
+  stopIndexPoll();
+  if (!current || !current.indexing || current.indexing.state !== 'running') return;
+  ixPoll = setInterval(async () => {
+    if (show.current !== 'detail' || !current) return stopIndexPoll();
+    try {
+      const fresh = await api('/api/shabads/' + current.id);
+      current.indexing = fresh.indexing;
+      const badge = document.querySelector('#detail [data-idx-badge]');
+      if (badge) {
+        badge.className = 'idx ' + fresh.indexing.state;
+        badge.textContent = IX_LABEL[fresh.indexing.state];
+      }
+      if ($('index-dialog').open) openIndexDialog();
+      if (fresh.indexing.state !== 'running') {
+        stopIndexPoll();
+        toast('Indexing finished');
+      }
+    } catch { stopIndexPoll(); }
+  }, 4000);
 }
 
 function paintLearnBtn(on, stage) {
@@ -501,6 +652,7 @@ $('e-save').onclick = async () => {
     }));
     $('edit-dialog').close();
     toast('Saved');
+    listLoaded = false;               // that card now shows the wrong tags
     await loadFilters();
     // a redraw, not a fresh open -- must not add a history row
     await openDetail(current.id, { silent: true });
@@ -515,6 +667,7 @@ $('e-delete').onclick = async () => {
     await api('/api/shabads/' + current.id, { method: 'DELETE' });
     $('edit-dialog').close();
     toast('Deleted');
+    listLoaded = false;               // that row is gone
     await loadFilters();
     go('list');                               // that row is gone; don't go back to it
   } catch (err) { toast(err.message, true); }
@@ -554,6 +707,7 @@ async function toggleShortlist(btn) {
     const r = await api('/api/shortlist/' + id, { method: wasOn ? 'DELETE' : 'POST' });
     setSavedCount(r.shortlist_count);
     deck.cards = [];              // a shortlisted shabad is no longer deck material
+    listLoaded = false;           // the heart on the list card is now stale
     if (current && String(current.id) === String(id)) current.shortlisted = !wasOn;
     // hearting from the detail view leaves the list card behind it stale
 
@@ -1302,9 +1456,32 @@ async function openPreview(shabadId, lineNo) {
 
 $('nav-list').onclick = () => go('list');
 $('nav-add').onclick = () => go('add');
+$('nav-settings').onclick = () => go('settings');
 $('back-to-list').onclick = goBack;
 $('d-edit').onclick = openEditDialog;
 $('d-heart').onclick = (e) => toggleShortlist(e.currentTarget);
+
+// Delegated, because #detail is rebuilt from scratch on every open -- handlers
+// bound to the old nodes would quietly stop firing.
+$('detail').addEventListener('click', (e) => {
+  if (e.target.closest('[data-idx-badge]')) return openIndexDialog();
+  const line = e.target.closest('.line[data-line-id]');
+  // Selecting the text of a tuk to read or copy it ends in a click, and that
+  // must not navigate away from what you were reading. A non-empty selection
+  // is the signal that the click was the end of a drag, not a tap.
+  if (line && !String(window.getSelection() || '').trim()) {
+    go('similar', { id: line.dataset.lineId });
+  }
+});
+$('detail').addEventListener('keydown', (e) => {
+  const line = e.target.closest('.line[data-line-id]');
+  if (line && (e.key === 'Enter' || e.key === ' ')) {
+    e.preventDefault();
+    go('similar', { id: line.dataset.lineId });
+  }
+});
+$('ix-close').onclick = () => $('index-dialog').close();
+$('ix-done').onclick = () => $('index-dialog').close();
 
 // ---- nav: a menu on a phone, buttons on a desktop ----
 const navOpen = (on) => {
@@ -1450,6 +1627,9 @@ $('s-source').onchange = runSearch;
                    'nav-learn', 'learn-due', 'learn-list', 'learn-start', 'learn-title',
                    'learn-sub', 'd-learn', 'practice', 'practice-quit',
                    'practice-progress', 'practice-timer',
+                   'nav-settings', 'set-models', 'set-scores', 'set-auto-index',
+                   'similar', 'sim-back', 'sim-blind', 'sim-open',
+                   'index-dialog', 'index-body', 'ix-close', 'ix-done',
                    ...VIEWS.map((v) => 'view-' + v)]
     .filter((id) => !$(id));
   if (missing.length) {

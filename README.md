@@ -264,6 +264,49 @@ app** — the app only ever reads vectors already in the database.
 
 ---
 
+## Indexing the library
+
+This is what turns the red badges green and makes the Similar page work.
+
+```bash
+python search/index_library.py --estimate              # cost, spends nothing
+python search/index_library.py --verify                # one call, checks the endpoint
+python search/index_library.py --model gemini37 --limit 200   # a small slice first
+python search/index_library.py --model gemini37        # the whole library
+python search/index_library.py --embed-only            # vectors for existing summaries
+```
+
+With no `--model` it does every model switched on in Settings.
+
+**Stop it whenever.** Ctrl-C, a reboot, a dead network — it writes to the
+database every 25 lines and only ever asks for lines that have no summary yet,
+so running it again carries on from where it stopped. Nothing already paid for
+is ever re-bought.
+
+Progress looks like this:
+
+```
+  gemini37    1204/4987  ███████░░░░░░░░░░░░░░░  24%   162/min  eta 23m18s  $1.09
+```
+
+**Two phases.** Summarising calls OpenRouter and costs money; embedding runs
+BGE-M3 locally and is free. `--summarise-only` and `--embed-only` split them.
+
+**Duplicate tuks are summarised once.** 303 of the 5,290 lines appear in more
+than one shabad; the same line means the same thing wherever it sits, so the
+summary is written to every line that shares it. About 6% off the bill.
+
+**`--batch` prices the work but cannot run it.** OpenRouter serves `:batch`
+models only through its async `/api/beta/batches` endpoint, which is
+submit-a-job-and-poll rather than a normal request. Worth about $2.30 on a full
+run if that path is ever implemented.
+
+**If the prompt in `summarize.py` changes**, `prompt_ver` changes with it and
+every line counts as unindexed again. That is deliberate (§6) — but it means
+editing that prompt costs a full re-run, so settle it on the bench first.
+
+---
+
 ## When something breaks
 
 **"address already in use" / server won't start** — a previous server is still holding the port:

@@ -18,6 +18,9 @@
     <button id="nav-learn">Learn <span id="learn-due" class="badge"></span></button>
     <button id="nav-history">History</button>
     <button id="nav-add">Full Search</button>
+    <!-- Settings is a gear, not another word: six labels already fill the bar,
+         and this is somewhere you go rarely rather than a place you work. -->
+    <button id="nav-settings" class="gear" title="Settings" aria-label="Settings">&#9881;</button>
   </nav>
 </header>
 
@@ -184,8 +187,77 @@
   <div id="preview"></div>
 </section>
 
+<!-- ============ SIMILAR ============ -->
+<!-- Reached by tapping a line inside a shabad, never from the nav: it is a
+     question about one tuk, so it has no meaning without one. -->
+<section id="view-similar" hidden>
+  <div class="detail-bar">
+    <button id="sim-back" class="secondary">&larr; Back</button>
+    <div class="detail-actions">
+      <label class="toggle" title="Hide which model suggested what until you have judged">
+        <input type="checkbox" id="sim-blind" checked> <span>Blind</span>
+      </label>
+      <button id="sim-open" class="secondary">Open shabad</button>
+    </div>
+  </div>
+  <div id="similar"></div>
+</section>
+
+<!-- ============ SETTINGS ============ -->
+<section id="view-settings" hidden>
+  <h2>Settings</h2>
+
+  <div class="panel">
+    <h3>Indexing</h3>
+    <label class="set-row">
+      <input type="checkbox" id="set-auto-index">
+      <div>
+        <b>Index new shabads automatically</b>
+        <div class="muted">When you add a shabad, a background pass summarises and
+          embeds its lines so it becomes searchable without waiting for you to run
+          anything. Roughly a cent per shabad, spent on your OpenRouter balance.
+          Only one pass ever runs at a time.</div>
+      </div>
+    </label>
+  </div>
+
+  <div class="panel">
+    <h3>Summariser models</h3>
+    <p class="muted">Switching one off stops it contributing results. Nothing is
+      deleted &mdash; its summaries and every vote you have cast survive, so
+      turning it back on costs nothing.</p>
+    <div id="set-models"></div>
+  </div>
+
+  <div class="panel">
+    <h3>Model scores</h3>
+    <p class="muted">From your thumbs. Credit is discounted by rank &mdash; a
+      result offered at #2 counts about 2.7&times; one at #19. <b>Unique</b>
+      counts only lines no other enabled model offered; a line everything
+      returned separates nobody.</p>
+    <div id="set-scores"></div>
+  </div>
+</section>
+
+<!-- ============ INDEXING DIALOG ============ -->
+<dialog id="index-dialog">
+  <div class="dialog-head">
+    <h2>Indexing</h2>
+    <button id="ix-close" class="secondary" aria-label="Close">&times;</button>
+  </div>
+  <div id="index-body"></div>
+  <div class="dialog-foot">
+    <span class="spacer"></span>
+    <button id="ix-done" class="secondary">Close</button>
+  </div>
+</dialog>
+
 <div id="toast" hidden></div>
 
 <script src="/static/app.js"></script>
+<!-- Loaded after app.js: these share its helpers ($, api, esc, go) rather than
+     growing a 1,500-line file further. No build step, so plain tags in order. -->
+<script src="/static/similar.js"></script>
+<script src="/static/settings.js"></script>
 </body>
 </html>

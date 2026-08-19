@@ -72,8 +72,14 @@ def load_lines(path=THEMES):
 
     lib = sqlite3.connect(f"file:{DB_PATH}?mode=ro", uri=True)
     lib.row_factory = sqlite3.Row
+    # summary comes from line_summaries now -- lines.summary was the old
+    # single-model column and has been dropped. Any model's summary will do
+    # here; this script only ever compares fields against each other.
     for r in lib.execute(
-            "SELECT gurmukhi, translation_en, teeka_pa, summary FROM lines"):
+            """SELECT l.gurmukhi, l.translation_en, l.teeka_pa,
+                      (SELECT ls.summary FROM line_summaries ls
+                        WHERE ls.line_id = l.id LIMIT 1) AS summary
+               FROM lines l"""):
         index[match_key(r["gurmukhi"])] = {                # library wins
             "gurmukhi": r["gurmukhi"], "translation_en": r["translation_en"],
             "teeka_pa": r["teeka_pa"], "summary": r["summary"], "src": "library"}

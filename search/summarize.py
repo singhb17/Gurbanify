@@ -1,8 +1,11 @@
 """Write an English thematic summary for each line, for embedding (CLAUDE.md §6).
 
     python summarize.py --list                       # what models are available
-    python summarize.py --themes themes_recall.json --model X --out bakeoff/X.json
-    python summarize.py --all --model X --limit 20   # write into shabads.db
+    python summarize.py --themes set.json --model X --out out/X.json
+
+To index the library itself, use index_library.py -- it writes per model, in
+checkpoints, and resumes. This file is the model-comparison side of the work and
+its SYSTEM prompt, which index_library.py imports.
 
 Everything goes through OpenRouter, so four candidate models need one API key and
 one bill instead of four of each. Put it in a file called `.env` next to this
@@ -15,8 +18,8 @@ repo access, and a leaked key is someone else spending your money.
 
 CLAUDE.md §12: the model is given Gurbani and asked ONLY for an English summary
 of its meaning. It never produces, corrects or transliterates Gurmukhi, and its
-output is only ever stored in `summary`, which is the derived layer (§5) and can
-be deleted and regenerated at will. Nothing it writes is shown as scripture.
+output only ever lands in `line_summaries`, which is the derived layer (§5) and
+can be deleted and regenerated at will. Nothing it writes is shown as scripture.
 """
 
 import argparse
@@ -231,9 +234,9 @@ def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--model", help="e.g. google/gemini-2.5-flash")
     ap.add_argument("--themes", help="score-set json; summarise only those lines")
-    ap.add_argument("--all", action="store_true", help="summarise the whole library")
+    # (no --all: use index_library.py, which writes per model and resumes)
     ap.add_argument("--limit", type=int, default=0)
-    ap.add_argument("--out", help="write json here instead of the database")
+    ap.add_argument("--out", required=False, help="write the summaries to this json")
     ap.add_argument("--list", action="store_true", help="show available models")
     args = ap.parse_args()
 
@@ -249,18 +252,8 @@ def main():
         rows, _, missing = load_lines(args.themes)
         if missing:
             print(f"{len(missing)} theme lines not found, skipping them")
-    elif args.all:
-        import sqlite3
-        conn = sqlite3.connect(os.path.join(ROOT, "shabads.db"))
-        conn.row_factory = sqlite3.Row
-        sql = ("SELECT id, gurmukhi, translation_en, teeka_pa FROM lines "
-               "WHERE summary IS NULL OR summary = '' ORDER BY id")
-        if args.limit:
-            sql += f" LIMIT {args.limit}"
-        rows = [dict(r) for r in conn.execute(sql)]
-        conn.close()
     else:
-        sys.exit("pass --themes <file> or --all")
+        sys.exit("pass --themes <file>  (to index the library use index_library.py)")
 
     if args.limit and args.themes:
         rows = rows[:args.limit]
@@ -281,20 +274,12 @@ def main():
         per = (usage["prompt_tokens"] + usage["completion_tokens"]) / len(rows)
         print(f"  ~{per:.0f} tokens per line -> ~{per * 5223 / 1e6:.2f}M for the full library")
 
-    if args.out:
-        os.makedirs(os.path.dirname(args.out) or ".", exist_ok=True)
-        json.dump({"model": args.model, "usage": usage, "summaries": out},
-                  io.open(args.out, "w", encoding="utf-8"), ensure_ascii=False, indent=1)
-        print(f"  wrote {args.out}")
-    else:
-        import sqlite3
-        conn = sqlite3.connect(os.path.join(ROOT, "shabads.db"))
-        with conn:
-            conn.executemany("UPDATE lines SET summary = ? WHERE id = ?",
-                             [(out[r["gurmukhi"]], r["id"]) for r in rows
-                              if r["gurmukhi"] in out])
-        conn.close()
-        print(f"  wrote {len(out)} summaries into shabads.db")
+    # Writing into the database is index_library.py's job now: it is per-model,
+    # checkpointed and resumable, none of which this ever was. Here, --out only.
+    os.makedirs(os.path.dirname(args.out) or ".", exist_ok=True)
+    json.dump({"model": args.model, "usage": usage, "summaries": out},
+              io.open(args.out, "w", encoding="utf-8"), ensure_ascii=False, indent=1)
+    print(f"  wrote {args.out}")
 
 
 if __name__ == "__main__":
