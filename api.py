@@ -12,17 +12,21 @@ Two SQLite files, deliberately separate (CLAUDE.md §5):
 Docker is NOT needed to run this; it's only needed to rebuild banidb.db.
 """
 
+import base64
 import datetime
+import io
 import os
 import random
 import re
+import secrets
 import sqlite3
 import subprocess
 import sys
+import time
 from typing import List, Optional
 
 from fastapi import FastAPI, HTTPException, Query
-from fastapi.responses import FileResponse, HTMLResponse
+from fastapi.responses import FileResponse, HTMLResponse, JSONResponse, Response
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
 
@@ -34,18 +38,102 @@ STATIC_DIR = os.path.join(HERE, "static")
 # and a crash on startup is invisible from both the app and the terminal.
 INDEX_LOG = os.path.join(HERE, "search", "index.log")
 
+
+def load_env():
+    """Read .env into the environment. Never committed -- see .gitignore."""
+    path = os.path.join(HERE, ".env")
+    if not os.path.exists(path):
+        return
+    for line in io.open(path, encoding="utf-8"):
+        line = line.strip()
+        if line and not line.startswith("#") and "=" in line:
+            k, v = line.split("=", 1)
+            os.environ.setdefault(k.strip(), v.strip().strip('"').strip("'"))
+
+
+load_env()
+
+# Set APP_PASSWORD in .env and every request needs it. Left unset, there is no
+# auth at all -- which is right on a laptop and wrong the moment the tunnel is
+# up, so the tunnel scripts refuse to start without one.
+APP_USER = os.environ.get("APP_USER", "keertan")
+APP_PASSWORD = os.environ.get("APP_PASSWORD", "")
+
 app = FastAPI(title="Shabad Library")
+
+
+@app.middleware("http")
+async def require_password(request, call_next):
+    """Basic Auth over the whole app.
+
+    NOT exempt for localhost, and that is the important part: cloudflared runs
+    on this machine and proxies to http://localhost:8000, so EVERY request from
+    the public tunnel arrives looking like 127.0.0.1. An exemption for local
+    addresses would therefore exempt the entire internet.
+
+    /health is the one open path. It returns a bare ok and no data, so it gives
+    an unauthenticated caller nothing, and it lets the watchdog check liveness
+    without carrying credentials around.
+    """
+    if not APP_PASSWORD or request.url.path == "/health":
+        return await call_next(request)
+
+    header = request.headers.get("authorization", "")
+    if header.startswith("Basic "):
+        try:
+            user, _, pw = base64.b64decode(header[6:]).decode("utf-8").partition(":")
+            # compare_digest, not ==: a plain comparison returns as soon as two
+            # characters differ, and the time it takes leaks how much of the
+            # password was right.
+            if (secrets.compare_digest(user, APP_USER)
+                    and secrets.compare_digest(pw, APP_PASSWORD)):
+                return await call_next(request)
+        except Exception:
+            pass                        # malformed header -- treat as no header
+    return Response(status_code=401, content="Authentication required",
+                    headers={"WWW-Authenticate": 'Basic realm="Shabad Library"'})
+
+
+@app.get("/health")
+def health():
+    """Liveness for the watchdog: is the process up AND is the database usable?
+
+    A port that accepts connections proves only that something is listening --
+    a process wedged on a locked database passes that test and fails every real
+    request. So this touches the database. It returns no data: an open endpoint
+    should tell an unauthenticated caller nothing beyond yes or no.
+    """
+    try:
+        conn = library()
+        try:
+            conn.execute("SELECT 1 FROM shabads LIMIT 1").fetchone()
+        finally:
+            conn.close()
+    except Exception as e:
+        return JSONResponse({"ok": False}, status_code=503,
+                            headers={"X-Error": type(e).__name__})
+    return {"ok": True}
 
 TAG_KINDS = ("genre", "speed")
 
 # The two summariser models the bench in search/ settled on: gemini37 led every
-# topic set, and deepseeknt was the best non-Google option once its reasoning was
+# topic set, and glm47nt is the best non-Google option once its reasoning is
 # turned off (which made it both cheaper AND better). Two, not three -- a third
 # means ~40 results to judge per query instead of ~25, which is the difference
 # between a habit and a chore. Adding one later is an INSERT, not a migration.
+#
+# glm47nt replaced deepseeknt on 2026-08-19, and NOT on quality: they benched a
+# single point apart, which is noise across 108 lines. On price. DeepSeek v4 Pro
+# roughly doubled mid-project -- every one of its twelve providers moved together,
+# so it was an upstream rise and not a routing accident -- taking a full index
+# from $3.75 to $6.67 while GLM 4.7 does the same work for $3.37.
+#
+# This is the churn §3 keys the derived layer by model to survive. The swap was
+# an UPDATE and a regenerate; no schema changed, and every vote already cast
+# stayed valid because line_relations records the judgement, not the model.
 DEFAULT_MODELS = (
     ("gemini37", "Gemini 3.7 Flash"),
-    ("deepseeknt", "DeepSeek v4 Pro"),
+    ("glm47nt", "GLM 4.7"),
 )
 
 SIMILAR_LIMIT = 20          # §3: about twenty results, ranked, never thresholded
@@ -84,25 +172,35 @@ def ensure_deck_schema():
                 )""")
             conn.execute("""
                 CREATE TABLE IF NOT EXISTS learning (
-                  shabad_id  INTEGER PRIMARY KEY REFERENCES shabads(id) ON DELETE CASCADE,
-                  added_at   TEXT NOT NULL DEFAULT (datetime('now')),
-                  rahao_ok   INTEGER NOT NULL DEFAULT 0
+                  shabad_id      INTEGER PRIMARY KEY REFERENCES shabads(id) ON DELETE CASCADE,
+                  added_at       TEXT NOT NULL DEFAULT (datetime('now')),
+                  status         TEXT NOT NULL DEFAULT 'not_started',
+                  last_practised TEXT
                 )""")
-            conn.execute("""
-                CREATE TABLE IF NOT EXISTS learning_lines (
-                  line_id     INTEGER PRIMARY KEY REFERENCES lines(id) ON DELETE CASCADE,
-                  shabad_id   INTEGER NOT NULL REFERENCES shabads(id) ON DELETE CASCADE,
-                  level       INTEGER NOT NULL DEFAULT 0,
-                  ease        REAL    NOT NULL DEFAULT 2.5,
-                  interval_d  REAL    NOT NULL DEFAULT 0,
-                  reps        INTEGER NOT NULL DEFAULT 0,
-                  lapses      INTEGER NOT NULL DEFAULT 0,
-                  due         TEXT,
-                  last_review TEXT
-                )""")
-            conn.execute("CREATE INDEX IF NOT EXISTS idx_learning_due ON learning_lines(due)")
-            conn.execute(
-                "CREATE INDEX IF NOT EXISTS idx_learning_shabad ON learning_lines(shabad_id)")
+            # The SM-2 layer that used to live here -- per-line ease, six levels,
+            # due dates, a rahao gate, daily caps -- is gone. It worked and went
+            # unused: being told what to practise and when turns something you
+            # want to do into something you are behind on. Dropped rather than
+            # tuned. See the memorization section below.
+            have = {r[1] for r in conn.execute("PRAGMA table_info(learning)")}
+            if "last_practised" not in have:
+                conn.execute("ALTER TABLE learning ADD COLUMN last_practised TEXT")
+                print("migrated: added learning.last_practised")
+            if "status" not in have:
+                conn.execute("ALTER TABLE learning ADD COLUMN status TEXT "
+                             "NOT NULL DEFAULT 'not_started'")
+                print("migrated: added learning.status")
+            if "rahao_ok" in have:
+                # Left behind by the meaning gate. Harmless, but a dead column
+                # invites someone to wonder later whether it still means anything.
+                try:
+                    conn.execute("ALTER TABLE learning DROP COLUMN rahao_ok")
+                    print("migrated: dropped learning.rahao_ok")
+                except sqlite3.OperationalError:
+                    pass                      # sqlite too old for DROP COLUMN
+            conn.execute("DROP TABLE IF EXISTS learning_lines")
+            conn.execute("DROP INDEX IF EXISTS idx_learning_due")
+            conn.execute("DROP INDEX IF EXISTS idx_learning_shabad")
 
             # --- similarity search + model comparison (CLAUDE.md §3) ---
             conn.execute("""
@@ -227,7 +325,7 @@ def model_rows(conn):
         "SELECT name, label, enabled, sort_order FROM models ORDER BY sort_order, name")]
 
 
-DEFAULT_SETTINGS = {"auto_index": "1"}
+DEFAULT_SETTINGS = {"auto_index": "1", "wake_lock": "1"}
 
 # The most an automatic background pass may spend in one go. A shabad averages
 # ten lines, about a cent, so this covers a normal add many times over while
@@ -242,8 +340,16 @@ def get_setting(conn, key):
     return row["value"] if row else DEFAULT_SETTINGS.get(key)
 
 
-def spawn_indexer():
+def spawn_indexer(model=None, budget=AUTO_INDEX_BUDGET):
     """Kick off an indexing pass in a DETACHED child process.
+
+    `model` limits the run to one model; the default of None means "every model
+    switched on in Settings", which is what the automatic pass wants.
+
+    `budget` is the ceiling in dollars. The default is deliberately small (see
+    AUTO_INDEX_BUDGET); a catch-up run started from the enable dialog passes the
+    figure the user was actually shown, so the run can never quietly exceed the
+    number they agreed to.
 
     Deliberately a subprocess and not a thread: BGE-M3 wants ~3 GB while it
     runs, and CLAUDE.md §7 is explicit that the web app never loads the model.
@@ -286,9 +392,11 @@ def spawn_indexer():
         log.write(f"\n=== spawn {datetime.datetime.now():%Y-%m-%d %H:%M:%S} "
                   f"(python: {sys.executable}) ===\n")
         log.flush()
-        subprocess.Popen([sys.executable, "-u", script, "--yes",
-                          "--max-spend", str(AUTO_INDEX_BUDGET)],
-                         cwd=HERE, stdout=log, stderr=subprocess.STDOUT,
+        cmd = [sys.executable, "-u", script, "--yes",
+               "--max-spend", "%.4f" % budget]
+        if model:
+            cmd += ["--model", model]
+        subprocess.Popen(cmd, cwd=HERE, stdout=log, stderr=subprocess.STDOUT,
                          stdin=subprocess.DEVNULL, **kw)
     except Exception as e:                 # never let this break adding a shabad
         print(f"auto-index could not start: {e}")
@@ -297,6 +405,406 @@ def spawn_indexer():
                 f.write(f"spawn failed: {type(e).__name__}: {e}\n")
         except OSError:
             pass
+
+
+def index_estimate(conn, name):
+    """What switching this model on would cost, without spending anything.
+
+    Everything here is imported from search/ rather than reimplemented, and that
+    matters more than it looks: if this screen priced the work with its own copy
+    of the arithmetic, the number shown before agreeing and the number actually
+    spent could drift apart silently. One implementation, two callers.
+
+    Prices are fetched live because they move -- a figure cached at the time the
+    model was registered is the wrong thing to put in front of a spend decision.
+    If that call fails, `cost` comes back None and the dialog says so instead of
+    guessing; a made-up price is worse than an honest blank.
+    """
+    search_dir = os.path.join(HERE, "search")
+    if search_dir not in sys.path:
+        sys.path.insert(0, search_dir)
+    import index_library as ix
+    from bench import fetch_prices, cost_for
+
+    reg = ix.registry()
+    if name not in reg:
+        raise HTTPException(404, f"{name} is not in models.json")
+
+    groups, covered, _ = ix.pending(conn, name, ix.prompt_version())
+    tpl = reg[name].get("tokens_per_line", 1000)
+
+    cost = None
+    try:
+        i, o = fetch_prices({reg[name]["id"]}).get(reg[name]["id"], (0.0, 0.0))
+        if i or o:
+            cost = cost_for(len(groups), tpl, i, o)
+    except Exception as e:
+        print(f"could not price {name}: {e}")
+
+    total = conn.execute("SELECT COUNT(*) FROM lines").fetchone()[0]
+    return {"model": name, "unique": len(groups), "lines": covered,
+            "total": total, "tokens_per_line": tpl, "cost": cost,
+            "balance": credit_balance(),
+            # A run already in flight holds the lock, so a second one would exit
+            # immediately without doing anything. Say that up front rather than
+            # letting the catch-up silently not happen.
+            "busy": bool(live_jobs(conn))}
+
+
+def credit_info():
+    """What OpenRouter says the account holds, or None if it can't be read.
+
+    Shown next to an estimate because the two together answer the only question
+    that matters at that moment -- can this run actually finish? A run that stops
+    two thirds of the way through wastes nothing already paid for, but it is
+    still better known in advance than discovered in the log.
+
+    Never raises. This is a nice-to-have on every screen that shows it, and a
+    network wobble at OpenRouter must not take out a page that is otherwise
+    working entirely from local data.
+    """
+    try:
+        search_dir = os.path.join(HERE, "search")
+        if search_dir not in sys.path:
+            sys.path.insert(0, search_dir)
+        import requests
+        from summarize import load_key
+        r = requests.get("https://openrouter.ai/api/v1/credits", timeout=8,
+                         headers={"Authorization": f"Bearer {load_key()}"})
+        d = r.json().get("data", {})
+        top, used = d.get("total_credits", 0), d.get("total_usage", 0)
+        return {"purchased": round(top, 2), "spent": round(used, 2),
+                "remaining": round(top - used, 2)}
+    except Exception:
+        return None                    # not worth surfacing; the estimate stands
+
+
+def credit_balance():
+    return (credit_info() or {}).get("remaining")
+
+
+# How long a job may go without a heartbeat before it is presumed dead. Defined
+# once because live_jobs and recent_jobs must agree: if one calls a job alive and
+# the other calls it stalled, the badge and the control panel contradict each
+# other over the same row.
+JOB_SILENT_S = 600
+
+EMBED_DIMS = 1024                      # BGE-M3 (CLAUDE.md §7)
+EMBED_BYTES = EMBED_DIMS * 4           # float32
+BACKUP_STALE_DAYS = 7
+LOW_BALANCE = 1.00
+
+
+def model_coverage(conn):
+    """How much of the library each model has actually finished.
+
+    Three numbers, not one, because the two phases fail independently and the
+    difference is diagnostic. Summaries are bought from an API and cost money;
+    embeddings are computed locally and are free. So `summarised > embedded`
+    means the expensive half succeeded and the free half was interrupted -- a
+    reassuring problem, fixed by --embed-only with no further spend. The reverse
+    cannot happen.
+
+    `stale` counts rows written by an older prompt. This is the query §5 says
+    prompt_ver exists to make possible: without it, an improved prompt leaves a
+    silent mix of old and new summaries and no way to tell them apart.
+    """
+    search_dir = os.path.join(HERE, "search")
+    if search_dir not in sys.path:
+        sys.path.insert(0, search_dir)
+    try:
+        import index_library as ix
+        ver = ix.prompt_version()
+    except Exception:
+        ver = None
+
+    total = conn.execute("SELECT COUNT(*) FROM lines").fetchone()[0]
+    stats = {r["model"]: dict(r) for r in conn.execute(
+        f"""SELECT model,
+                   COUNT(*)                                            AS summarised,
+                   SUM(embedding IS NOT NULL)                          AS embedded,
+                   SUM(embedding IS NOT NULL
+                       AND LENGTH(embedding) <> {EMBED_BYTES})         AS malformed,
+                   SUM(prompt_ver <> ?)                                AS stale,
+                   SUM(LENGTH(embedding))                              AS bytes
+            FROM line_summaries GROUP BY model""", (ver or "",))}
+
+    out = []
+    for m in model_rows(conn):
+        s = stats.pop(m["name"], {})
+        done = min(s.get("summarised", 0) or 0, s.get("embedded", 0) or 0)
+        out.append({**m, "total": total,
+                    "summarised": s.get("summarised", 0) or 0,
+                    "embedded": s.get("embedded", 0) or 0,
+                    "malformed": s.get("malformed", 0) or 0,
+                    "stale": (s.get("stale", 0) or 0) if ver else None,
+                    "bytes": s.get("bytes", 0) or 0,
+                    "coverage": (done / total) if total else 0})
+    # Rows for models no longer in `models` -- summaries paid for and still on
+    # disk, but invisible everywhere else in the app. Worth seeing here.
+    for name, s in stats.items():
+        out.append({"name": name, "label": name, "enabled": 0, "orphan": True,
+                    "total": total, "summarised": s["summarised"] or 0,
+                    "embedded": s["embedded"] or 0, "malformed": s["malformed"] or 0,
+                    "stale": None, "bytes": s["bytes"] or 0, "coverage": 0})
+    return out, ver
+
+
+def lock_state():
+    """Whether an indexer holds the machine-wide lock, and for how long.
+
+    A lock with no live job behind it is the fingerprint of a killed process --
+    a reboot mid-run, a closed terminal. It blocks every later run silently,
+    which is exactly the kind of failure that is invisible from the app and
+    obvious here.
+    """
+    path = os.path.join(HERE, "search", ".index.lock")
+    if not os.path.exists(path):
+        return {"held": False}
+    age = time.time() - os.path.getmtime(path)
+    return {"held": True, "age_s": int(age), "stale": age > 6 * 3600}
+
+
+def backup_state():
+    """Newest file in backups/, because §8 says backups are not optional.
+
+    Nothing else in the app ever mentions backups, so if the nightly job was
+    never set up -- or set up and quietly failing -- there is currently no
+    surface anywhere that would say so. This is that surface.
+    """
+    d = os.path.join(HERE, "backups")
+    try:
+        files = [os.path.join(d, f) for f in os.listdir(d) if f.endswith(".db")]
+    except OSError:
+        return {"count": 0, "newest": None, "age_days": None}
+    if not files:
+        return {"count": 0, "newest": None, "age_days": None}
+    newest = max(files, key=os.path.getmtime)
+    age = (time.time() - os.path.getmtime(newest)) / 86400
+    return {"count": len(files), "newest": os.path.basename(newest),
+            "age_days": round(age, 1), "bytes": os.path.getsize(newest)}
+
+
+def log_tail(n=40, cap=16384):
+    """The end of the indexer's log.
+
+    A detached child writes here and nowhere else, so when "I enabled a model
+    and nothing happened" happens again, this is the only place the reason
+    exists. Read from the end so the file can grow without bound.
+    """
+    try:
+        size = os.path.getsize(INDEX_LOG)
+        with open(INDEX_LOG, "rb") as f:
+            f.seek(max(0, size - cap))
+            text = f.read().decode("utf-8", "replace")
+        lines = [l.rstrip() for l in text.splitlines() if l.strip()]
+        return lines[-n:], size
+    except OSError:
+        return [], 0
+
+
+def build_alerts(conn, models, jobs, lock, backups, credit, ver):
+    """Everything currently wrong, worst first.
+
+    Deliberately derived here rather than in the browser: these are judgements
+    about the system ("a job that stopped is a problem, a job you stopped is
+    not"), and they belong next to the data they judge. The page then only has
+    to render a list, which is why it stays simple as the checks multiply.
+    """
+    a = []
+    def add(level, title, detail):
+        a.append({"level": level, "title": title, "detail": detail})
+
+    if credit is None:
+        add("warn", "Cannot reach OpenRouter",
+            "Balance unknown. Indexing may fail; the key or the network is the "
+            "usual cause.")
+    elif credit["remaining"] <= 0:
+        add("error", "Out of credit",
+            f"${credit['remaining']:.2f} remaining. Indexing will fail until "
+            "you top up.")
+    elif credit["remaining"] < LOW_BALANCE:
+        add("warn", "Low balance",
+            f"${credit['remaining']:.2f} remaining.")
+
+    for j in jobs:
+        if j["state"] == "failed":
+            add("error", f"Indexing failed — {j['model']}",
+                (j.get("error") or "no reason recorded")[:300])
+        elif j["state"] == "stalled":
+            add("error", f"Indexing stopped without finishing — {j['model']}",
+                f"{j['done']}/{j['total']} done, ${j['spent']:.2f} spent, then "
+                "silent. Nothing paid for was lost; run it again to carry on.")
+
+    for m in models:
+        if m.get("orphan") and m["summarised"]:
+            add("info", f"Summaries with no model — {m['name']}",
+                f"{m['summarised']:,} rows for a model no longer registered. "
+                "They cost real money, so they are kept, not deleted.")
+            continue
+        gap = m["summarised"] - m["embedded"]
+        if gap > 0:
+            add("warn", f"Summaries without vectors — {m['label']}",
+                f"{gap:,} lines are summarised but not embedded, so they cannot "
+                "be searched. Free to fix: run index_library.py --embed-only.")
+        if m["malformed"]:
+            add("error", f"Malformed vectors — {m['label']}",
+                f"{m['malformed']:,} embeddings are not {EMBED_BYTES} bytes. "
+                "Those rows are corrupt and should be re-embedded.")
+        if m["stale"]:
+            add("warn", f"Summaries from an older prompt — {m['label']}",
+                f"{m['stale']:,} rows predate the current prompt ({ver}). They "
+                "still work; regenerating them costs the usual per-line price.")
+        if m["enabled"] and not m["summarised"]:
+            add("warn", f"Switched on but not indexed — {m['label']}",
+                "It contributes nothing to search until it has summaries.")
+
+    if lock.get("stale"):
+        add("error", "Stale indexing lock",
+            f"Held for {lock['age_s'] // 3600}h with nothing running — a killed "
+            "process. It blocks new runs until removed.")
+
+    if backups["age_days"] is None:
+        add("error", "No backups",
+            "Nothing in backups/. §5's 'mine' layer — status, notes, tags, "
+            "votes — can be regenerated by nothing.")
+    elif backups["age_days"] > BACKUP_STALE_DAYS:
+        add("warn", "Backup is old",
+            f"Newest is {backups['age_days']:.0f} days old.")
+
+    orphans = conn.execute(
+        "SELECT COUNT(*) FROM shabads s WHERE NOT EXISTS "
+        "(SELECT 1 FROM lines l WHERE l.shabad_id = s.id)").fetchone()[0]
+    if orphans:
+        add("warn", "Shabads with no lines",
+            f"{orphans} saved shabad(s) have no verses — a BaniDB fetch that "
+            "did not complete. §12: the gap is surfaced, not filled in.")
+    return a
+
+
+def recent_jobs(conn, limit=5):
+    """The last few indexing runs, with 'running' reinterpreted honestly.
+
+    A row says `running` because that is what the process wrote when it started;
+    it says nothing about whether the process still exists. A killed run leaves
+    that row claiming to run forever. So a heartbeat older than the cutoff is
+    reported as `stalled` -- a distinct state, because "still going" and "died
+    without saying so" need different responses from the reader, and the raw
+    column cannot tell them apart.
+    """
+    rows = [dict(r) for r in conn.execute(
+        """SELECT id, model, state, phase, total, done, spent, error,
+                  started_at, updated_at,
+                  CAST((julianday('now') - julianday(updated_at)) * 86400 AS INT)
+                    AS quiet_s
+           FROM index_jobs ORDER BY id DESC LIMIT ?""", (limit,))]
+    for r in rows:
+        if r["state"] == "running" and (r["quiet_s"] or 0) > JOB_SILENT_S:
+            r["state"] = "stalled"
+    return rows
+
+
+@app.get("/api/status")
+def get_status():
+    """One call, everything the control panel shows.
+
+    Deliberately a single endpoint rather than six. The page is a snapshot of
+    one moment; assembled from six requests it could show a job as running in
+    one panel and finished in another, and a diagnostics screen that contradicts
+    itself is worse than no diagnostics screen.
+
+    Read-only throughout. Nothing here starts, stops, or repairs anything --
+    diagnosing and acting are separate, so that opening this page is always safe.
+    """
+    conn = library()
+    try:
+        models, ver = model_coverage(conn)
+        jobs = recent_jobs(conn, 12)
+        lock = lock_state()
+        backups = backup_state()
+        credit = credit_info()
+        log, log_bytes = log_tail()
+
+        counts = {}
+        for key, sql in (
+                ("shabads",   "SELECT COUNT(*) FROM shabads"),
+                ("lines",     "SELECT COUNT(*) FROM lines"),
+                ("tags",      "SELECT COUNT(*) FROM tags"),
+                ("shortlist", "SELECT COUNT(*) FROM shortlist"),
+                ("history",   "SELECT COUNT(*) FROM history"),
+                ("learning",  "SELECT COUNT(*) FROM learning"),
+                ("votes",     "SELECT COUNT(*) FROM line_relations"),
+                ("user_added", "SELECT COUNT(*) FROM shabads WHERE is_user_added = 1"),
+                ("no_teeka",  "SELECT COUNT(*) FROM lines WHERE teeka_pa IS NULL OR teeka_pa = ''"),
+                ("no_english", "SELECT COUNT(*) FROM lines WHERE translation_en IS NULL OR translation_en = ''"),
+        ):
+            try:
+                counts[key] = conn.execute(sql).fetchone()[0]
+            except sqlite3.Error:
+                counts[key] = None      # table not migrated yet; not fatal here
+
+        return {
+            "alerts": build_alerts(conn, models, jobs, lock, backups, credit, ver),
+            "account": credit,
+            "models": models,
+            "jobs": jobs,
+            "lock": lock,
+            "backups": backups,
+            "library": counts,
+            "prompt_ver": ver,
+            "auto_index": get_setting(conn, "auto_index") == "1",
+            "storage": {
+                "library_db": file_size(LIBRARY_DB),
+                "corpus_db": file_size(CORPUS_DB),
+                "vectors": sum(m["bytes"] for m in models),
+                "log": log_bytes,
+            },
+            "log": log,
+            "now": datetime.datetime.now().isoformat(timespec="seconds"),
+        }
+    finally:
+        conn.close()
+
+
+@app.post("/api/backup")
+def run_backup():
+    """Run tools/backup.py and hand back exactly what it printed.
+
+    The one action allowed on an otherwise read-only page, because it is the one
+    that cannot make anything worse: it only ever adds files, running it twice is
+    harmless, and it is precisely what the "no backups" alert tells you to do.
+    Everything else there stays diagnosis-only.
+
+    SYNCHRONOUS, unlike spawn_indexer. That is not an inconsistency -- indexing
+    runs for hours and must not block a page load, while this takes a couple of
+    seconds, and waiting means the answer can be the real filenames and sizes
+    rather than a hopeful "started". A backup you were told about but that
+    silently failed is worse than no button at all.
+
+    The script's own stdout is returned verbatim rather than being summarised.
+    It already reports what it wrote and what it pruned; re-wording that here
+    would be a second description of the same event, free to drift from the first.
+    """
+    script = os.path.join(HERE, "tools", "backup.py")
+    if not os.path.exists(script):
+        raise HTTPException(500, "tools/backup.py is missing")
+    try:
+        p = subprocess.run([sys.executable, "-u", script], cwd=HERE,
+                           capture_output=True, text=True,
+                           encoding="utf-8", errors="replace", timeout=300)
+    except subprocess.TimeoutExpired:
+        raise HTTPException(504, "backup timed out after 5 minutes")
+    except OSError as e:
+        raise HTTPException(500, f"could not run backup.py: {e}")
+    return {"ok": p.returncode == 0, "code": p.returncode,
+            "output": (p.stdout + p.stderr).strip() or "(no output)"}
+
+
+def file_size(path):
+    try:
+        return os.path.getsize(path)
+    except OSError:
+        return None
 
 
 def live_jobs(conn):
@@ -312,14 +820,8 @@ def live_jobs(conn):
         """SELECT id, model, state, phase, total, done, spent, started_at, updated_at
            FROM index_jobs
            WHERE state = 'running'
-             AND updated_at >= datetime('now', '-10 minutes')
-           ORDER BY id""")]
-
-
-def recent_jobs(conn, limit=5):
-    return [dict(r) for r in conn.execute(
-        "SELECT id, model, state, phase, total, done, spent, error, "
-        "started_at, updated_at FROM index_jobs ORDER BY id DESC LIMIT ?", (limit,))]
+             AND updated_at >= datetime('now', ?)
+           ORDER BY id""", (f"-{JOB_SILENT_S} seconds",))]
 
 
 def indexing_status(conn, shabad_id):
@@ -445,7 +947,32 @@ def keywords_clause(column, q):
     return sql, [like_arg(t) for t in terms]
 
 
-def filter_clauses(status, rarity, genre, speed, raag, writer):
+# How long a shabad is, in bands rather than an exact number.
+#
+# Three, not a slider. The question being asked is "is this short enough to
+# fit the programme", which does not deserve single-line precision, and bands
+# render as ordinary chips so they need no new control on any of the three
+# panels that show filters.
+#
+# Multi-select is what makes one control cover every case: short+medium is a
+# maximum of 16, medium+long is a minimum of 9, medium alone is a band. So the
+# "I might want a minimum later" case is already built, with nothing to add.
+#
+# Boundaries from the real distribution -- median 11, p90 25 -- which splits the
+# library roughly 29 / 46 / 25.
+LENGTH_BANDS = (
+    ("short",  "Short",  1,  8),
+    ("medium", "Medium", 9,  16),
+    ("long",   "Long",   17, 10_000),
+)
+LENGTH_BY_ID = {b[0]: b for b in LENGTH_BANDS}
+
+# Counting lines per shabad is a correlated subquery; naming it once keeps the
+# library, the deck and the similar page using the identical expression.
+LINE_COUNT_SQL = "(SELECT COUNT(*) FROM lines l2 WHERE l2.shabad_id = s.id)"
+
+
+def filter_clauses(status, rarity, genre, speed, raag, writer, length=None):
     """The tag/metadata WHERE clauses shared by the library list and the deck.
 
     Shared so the deck can never disagree with the library about what "Status:
@@ -465,6 +992,16 @@ def filter_clauses(status, rarity, genre, speed, raag, writer):
             where.append(f"""EXISTS(SELECT 1 FROM tags t WHERE t.shabad_id = s.id
                              AND t.kind = ? AND t.value IN ({','.join('?' * len(vals))}))""")
             args += [kind] + vals
+
+    # Bands are OR'd with each other and AND'd with everything else: picking
+    # Short and Long means either of those, not neither.
+    bands = [LENGTH_BY_ID[v] for v in (length or []) if v in LENGTH_BY_ID]
+    if bands:
+        parts = []
+        for _, _, lo, hi in bands:
+            parts.append(f"{LINE_COUNT_SQL} BETWEEN ? AND ?")
+            args += [lo, hi]
+        where.append("(" + " OR ".join(parts) + ")")
     return where, args
 
 
@@ -563,6 +1100,7 @@ def list_shabads(
     speed: Optional[List[str]] = Query(None),
     raag: Optional[List[str]] = Query(None),
     writer: Optional[List[str]] = Query(None),
+    length: Optional[List[str]] = Query(None),
     sort: str = "id",
 ):
     where, args = [], []
@@ -590,7 +1128,7 @@ def list_shabads(
                                    AND ({line_sql})))""")
                 args += note_args + line_args
 
-    fwhere, fargs = filter_clauses(status, rarity, genre, speed, raag, writer)
+    fwhere, fargs = filter_clauses(status, rarity, genre, speed, raag, writer, length)
     where += fwhere
     args += fargs
 
@@ -657,9 +1195,8 @@ def get_shabad(shabad_id: int):
     # heart reads as empty on a shabad that IS shortlisted
     shortlisted = conn.execute(
         "SELECT 1 FROM shortlist WHERE shabad_id = ?", (shabad_id,)).fetchone() is not None
-    lrn = conn.execute("SELECT rahao_ok FROM learning WHERE shabad_id = ?",
-                       (shabad_id,)).fetchone()
-    prog = learning_progress(conn, [shabad_id]).get(shabad_id) if lrn else None
+    lrn = conn.execute("SELECT 1 FROM learning WHERE shabad_id = ?",
+                       (shabad_id,)).fetchone() is not None
     # How far the derived layer (CLAUDE.md §5) has got for this shabad. Reads
     # zero for everything until the summary/embedding pipeline exists, which is
     # exactly what makes it a useful progress indicator for that work.
@@ -669,9 +1206,7 @@ def get_shabad(shabad_id: int):
     out["lines"] = [{k: v for k, v in l.items() if k != "embedding"} for l in lines]
     out["tags"] = tags
     out["shortlisted"] = shortlisted
-    out["learning"] = lrn is not None
-    out["learning_progress"] = prog
-    out["learning_stage"] = stage_name(prog, lrn["rahao_ok"]) if lrn else None
+    out["learning"] = lrn
     out["indexing"] = ix
     return out
 
@@ -800,6 +1335,19 @@ def filters():
     for kind in TAG_KINDS:
         out[kind] = [r[0] for r in conn.execute(
             "SELECT DISTINCT value FROM tags WHERE kind = ? ORDER BY 1", (kind,))]
+
+    # Bands come from the server with their boundaries and live counts, so the
+    # UI renders whatever is defined here and the two can never disagree about
+    # where "Short" ends. Objects rather than bare strings: the chip needs a
+    # label ("Short 1-8") that is not the value it posts back ("short").
+    out["length"] = [
+        {"value": vid,
+         "label": f"{label} {lo}+" if hi > 999 else f"{label} {lo}–{hi}",
+         "count": conn.execute(
+             f"SELECT COUNT(*) FROM shabads s WHERE {LINE_COUNT_SQL} BETWEEN ? AND ?",
+             (lo, hi)).fetchone()[0]}
+        for vid, label, lo, hi in LENGTH_BANDS]
+
     out["total"] = conn.execute("SELECT COUNT(*) FROM shabads").fetchone()[0]
     conn.close()
     return out
@@ -820,6 +1368,7 @@ def deck(
     speed: Optional[List[str]] = Query(None),
     raag: Optional[List[str]] = Query(None),
     writer: Optional[List[str]] = Query(None),
+    length: Optional[List[str]] = Query(None),
     include_shortlisted: bool = False,
 ):
     """A shuffled deck of shabads not already shortlisted.
@@ -838,7 +1387,7 @@ def deck(
                                    WHERE sl.shabad_id = s.id AND sl.list = ?)""")
         args.append(list_name)
 
-    fwhere, fargs = filter_clauses(status, rarity, genre, speed, raag, writer)
+    fwhere, fargs = filter_clauses(status, rarity, genre, speed, raag, writer, length)
     where += fwhere
     args += fargs
 
@@ -1090,174 +1639,101 @@ def clear_history():
 
 # --- memorization -------------------------------------------------------------
 #
-# The scaffold. Each rung removes more of the cue; levels 1-4 are checked
-# objectively by typing first letters, which is the same muscle memory used to
-# search on STTM. Only level 5 is self-graded, because typing full Gurmukhi to
-# prove a point would be miserable.
-LEVELS = [
-    "Learn",        # 0 - read it with the meaning in front of you
-    "Meaning",      # 1 - given the English, pick the right tuk
-    "First letters",# 2 - given the English, type the first letters
-    "Chained",      # 3 - given the PREVIOUS tuk, type this one's first letters
-    "From memory",  # 4 - given only the position, type the first letters
-    "Full recall",  # 5 - recite it whole, self-graded
-]
-MAX_LEVEL = len(LEVELS) - 1
-
-# Nothing ever graduates (CLAUDE.md §3). Vanilla SM-2 grows intervals without
-# limit, which is exactly how a shabad memorised once quietly disappears.
-MAX_INTERVAL_DAYS = 60.0
-
-NEW_LINES_PER_DAY = 12          # about one shabad; stops enthusiasm outrunning recall
-SESSION_LINES = 40              # a short daily burst, not a due-list dump
+# A LIST, and tools to test yourself with. Nothing more.
+#
+# This replaced a full SM-2 implementation: per-line ease factors, six scaffold
+# levels, a rahao meaning gate, daily new-material caps, interval scheduling.
+# It was carefully built and never used once. The scheduling was the problem --
+# being told what to practise and when turns a thing you want to do into a thing
+# you are behind on, and the honest response to that is to delete it rather than
+# to tune it.
+#
+# So: no due dates, no levels, no gates, no caps, no streaks. Add a shabad, and
+# test yourself on it whenever you feel like it, in whichever mode you feel like.
+# The only thing recorded is when you last practised, and that is information,
+# never a schedule.
 
 
-def sm2(ease, interval, reps, grade):
-    """One SM-2 step. grade: 0 blank, 1 nearly, 2 got it.
-
-    Three-way rather than pass/fail because the target sits between word-perfect
-    and good-enough: "nearly" shortens the gap without throwing away the history.
-    """
-    if grade == 0:
-        return max(1.3, ease - 0.20), 1.0, reps + 1, True      # lapse
-    if grade == 1:
-        ease = max(1.3, ease - 0.15)
-        interval = 1.0 if reps == 0 else max(1.0, interval * 1.2)
-    else:
-        ease = min(2.8, ease + 0.10)
-        interval = 1.0 if reps == 0 else (6.0 if reps == 1 else interval * ease)
-    return ease, min(interval, MAX_INTERVAL_DAYS), reps + 1, False
-
-
-def rahao_line(conn, shabad_id):
-    """The line the meaning gate asks about.
-
-    Traditionally the rahao holds the shabad's central idea, so understanding it
-    is understanding what you're about to memorise. Only ~67% of shabads have a
-    detectable ਰਹਾਉ, so fall back to the line I saved the shabad by -- my own
-    choice of its key line, which is the next best thing.
-    """
-    row = conn.execute(
-        """SELECT * FROM lines WHERE shabad_id = ? AND gurmukhi LIKE '%' || ? || '%'
-           ORDER BY line_no LIMIT 1""", (shabad_id, "ਰਹਾਉ")).fetchone()
-    if row:
-        return dict(row)
-    row = conn.execute(
-        """SELECT l.* FROM lines l JOIN shabads s ON s.id = l.shabad_id
-           WHERE l.shabad_id = ? AND l.line_no = COALESCE(s.source_line_no, 1)""",
-        (shabad_id,)).fetchone()
-    return dict(row) if row else None
-
-
-def learning_progress(conn, shabad_ids):
-    """Per-shabad stage, derived from its lines -- never set by hand."""
-    if not shabad_ids:
-        return {}
-    ph = ",".join("?" * len(shabad_ids))
-    out = {}
-    for r in conn.execute(
-            f"""SELECT shabad_id, COUNT(*) n, AVG(level) avg_level, SUM(reps) reps,
-                       MIN(due) next_due, MIN(interval_d) min_interval
-                FROM learning_lines WHERE shabad_id IN ({ph})
-                GROUP BY shabad_id""", shabad_ids):
-        out[r["shabad_id"]] = {
-            "lines": r["n"],
-            "avg_level": round(r["avg_level"] or 0, 2),
-            "percent": round(100 * (r["avg_level"] or 0) / MAX_LEVEL),
-            "reviews": r["reps"] or 0,
-            "next_due": r["next_due"],
-            "matured": (r["min_interval"] or 0) >= MAX_INTERVAL_DAYS,
-        }
-    return out
-
-
-def stage_name(p, rahao_ok):
-    if not p or not p["reviews"]:
-        return "Not started"
-    if not rahao_ok:
-        return "Understanding"
-    if p["matured"] and p["avg_level"] >= MAX_LEVEL:
-        return "Maintenance"
-    if p["avg_level"] >= MAX_LEVEL - 0.5:
-        return "Memorised"
-    if p["avg_level"] >= 2:
-        return "Consolidating"
-    return "Learning"
+# Where a shabad is in your head, set by hand. Three, not five: the whole point
+# of removing the scheduler was to stop the app having opinions, and a scale fine
+# enough to agonise over is an opinion by another route.
+#
+# Ordered worst-first so the list opens on what still needs work rather than on
+# what is already done.
+LEARN_STATES = ("not_started", "in_progress", "memorized")
 
 
 @app.get("/api/learning")
-def list_learning():
+def list_learning(status: Optional[List[str]] = Query(None)):
+    """Everything being memorised. Unstarted first, then newest."""
+    where, args = [], []
+    if status:
+        keep = [s for s in status if s in LEARN_STATES]
+        if keep:
+            where.append(f"lg.status IN ({','.join('?' * len(keep))})")
+            args += keep
+    clause = f"WHERE {' AND '.join(where)}" if where else ""
     conn = library()
     try:
         rows = decorate(conn, [dict(r) for r in conn.execute(
-            """SELECT s.*, lg.added_at, lg.rahao_ok,
-                      (SELECT COUNT(*) FROM lines l WHERE l.shabad_id = s.id) line_count
-               FROM learning lg JOIN shabads s ON s.id = lg.shabad_id
-               ORDER BY lg.added_at DESC""")])
-        prog = learning_progress(conn, [r["id"] for r in rows])
-        # same builder the session uses, so the tab can never promise practice
-        # that Start refuses to give
-        queue, allowance = build_queue(conn, 10_000)
-        due_now = {q["shabad_id"] for q in queue}
-        for r in rows:
-            p = prog.get(r["id"])
-            r["progress"] = p
-            r["stage"] = stage_name(p, r["rahao_ok"])
-            r["due"] = r["id"] in due_now
-        # so the ui can say WHY there's nothing to do: held back by the daily
-        # new-material cap reads very differently from genuinely all caught up
-        waiting = conn.execute(
-            "SELECT COUNT(*) FROM learning_lines WHERE due IS NULL").fetchone()[0]
-        next_due = conn.execute(
-            "SELECT MIN(due) FROM learning_lines WHERE due > date('now')").fetchone()[0]
+            f"""SELECT s.*, lg.added_at, lg.last_practised, lg.status AS learn_status,
+                       (SELECT COUNT(*) FROM lines l WHERE l.shabad_id = s.id) line_count
+                FROM learning lg JOIN shabads s ON s.id = lg.shabad_id
+                {clause}
+                ORDER BY CASE lg.status WHEN 'not_started' THEN 0
+                                        WHEN 'in_progress' THEN 1 ELSE 2 END,
+                         lg.added_at DESC""", args)])
+        counts = {s: 0 for s in LEARN_STATES}
+        for r in conn.execute("SELECT status, COUNT(*) FROM learning GROUP BY status"):
+            counts[r[0]] = r[1]
     finally:
         conn.close()
-    return {"count": len(rows), "due_lines": len(queue), "new_waiting": waiting,
-            "new_allowance": allowance, "next_due": next_due, "shabads": rows}
+    return {"count": len(rows), "shabads": rows, "counts": counts,
+            "total": sum(counts.values())}
 
 
-class Review(BaseModel):
-    line_id: int
-    grade: int                                  # 0 blank, 1 nearly, 2 got it
+class LearnStatus(BaseModel):
+    status: str
 
 
-# MUST be declared before /api/learning/{shabad_id}: FastAPI matches routes in
-# declaration order, so with the parameterised one first, "review" is handed to
-# it as a shabad id, fails to parse as an int, and every review 422s.
-@app.post("/api/learning/review")
-def post_review(body: Review):
-    return review_line(body)
+@app.patch("/api/learning/{shabad_id}")
+def set_learn_status(shabad_id: int, body: LearnStatus):
+    if body.status not in LEARN_STATES:
+        raise HTTPException(400, f"status must be one of {', '.join(LEARN_STATES)}")
+    conn = library(write=True)
+    try:
+        with conn:
+            cur = conn.execute("UPDATE learning SET status = ? WHERE shabad_id = ?",
+                               (body.status, shabad_id))
+        if not cur.rowcount:
+            raise HTTPException(404, "not being learned")
+    finally:
+        conn.close()
+    return {"shabad_id": shabad_id, "status": body.status}
 
 
 @app.post("/api/learning/{shabad_id}")
 def add_to_learning(shabad_id: int):
-    """Start memorising a shabad. Every line gets a progress row -- that set IS
-    the scope, so a line selector later needs no schema change."""
     conn = library(write=True)
     try:
         if not conn.execute("SELECT 1 FROM shabads WHERE id = ?", (shabad_id,)).fetchone():
             raise HTTPException(404, "no such shabad")
         with conn:
-            conn.execute("INSERT OR IGNORE INTO learning (shabad_id) VALUES (?)", (shabad_id,))
-            conn.execute(
-                """INSERT OR IGNORE INTO learning_lines (line_id, shabad_id)
-                   SELECT id, shabad_id FROM lines WHERE shabad_id = ?""", (shabad_id,))
-        n = conn.execute("SELECT COUNT(*) FROM learning_lines WHERE shabad_id = ?",
-                         (shabad_id,)).fetchone()[0]
+            conn.execute("INSERT OR IGNORE INTO learning (shabad_id) VALUES (?)",
+                         (shabad_id,))
         total = conn.execute("SELECT COUNT(*) FROM learning").fetchone()[0]
     finally:
         conn.close()
-    return {"added": shabad_id, "lines": n, "learning_count": total}
+    return {"added": shabad_id, "learning_count": total}
 
 
 @app.delete("/api/learning/{shabad_id}")
 def remove_from_learning(shabad_id: int):
-    """Drops all memorization progress for this shabad. Irreversible."""
+    """Just removes it from the list. There is no progress to lose."""
     conn = library(write=True)
     try:
         with conn:
             cur = conn.execute("DELETE FROM learning WHERE shabad_id = ?", (shabad_id,))
-            conn.execute("DELETE FROM learning_lines WHERE shabad_id = ?", (shabad_id,))
         if not cur.rowcount:
             raise HTTPException(404, "not being learned")
         total = conn.execute("SELECT COUNT(*) FROM learning").fetchone()[0]
@@ -1266,166 +1742,92 @@ def remove_from_learning(shabad_id: int):
     return {"removed": shabad_id, "learning_count": total}
 
 
-@app.get("/api/learning/gate/{shabad_id}")
-def meaning_gate(shabad_id: int):
-    """The rahao meaning check: the tuk, and four English meanings to choose from.
+@app.get("/api/learning/{shabad_id}/lines")
+def learning_lines_for(shabad_id: int):
+    """Every line of one shabad, with what each practice mode needs.
 
-    Distractors come from the library's own other shabads -- no LLM, and they're
-    real Gurbani meanings rather than invented wrong answers. Once §7's vectors
-    exist these should come from the most SIMILAR lines instead of random ones,
-    which turns a recognition test into real discrimination.
+    ALL lines, headers included (CLAUDE.md §3). Line 1 is usually the raag and
+    mahalla rather than a real tuk, but not always -- and a heuristic that
+    skipped it would misfire exactly on the shabads that open on a true tuk.
+    One extra line costs nothing to page past.
     """
     conn = library()
     try:
-        line = rahao_line(conn, shabad_id)
-        if not line:
-            raise HTTPException(404, "no lines for that shabad")
-        others = [r[0] for r in conn.execute(
-            """SELECT translation_en FROM lines
-               WHERE shabad_id <> ? AND translation_en IS NOT NULL AND translation_en <> ''
-               ORDER BY RANDOM() LIMIT 3""", (shabad_id,))]
+        sh = conn.execute("SELECT * FROM shabads WHERE id = ?", (shabad_id,)).fetchone()
+        if not sh:
+            raise HTTPException(404, "no such shabad")
+        lines = [dict(r) for r in conn.execute(
+            """SELECT id, line_no, gurmukhi, transliteration_en, translation_en,
+                      teeka_pa, first_letters
+               FROM lines WHERE shabad_id = ? ORDER BY line_no""", (shabad_id,))]
+        learning = conn.execute("SELECT 1 FROM learning WHERE shabad_id = ?",
+                                (shabad_id,)).fetchone() is not None
     finally:
         conn.close()
-    options = [line["translation_en"], *others]
-    random.shuffle(options)
-    return {
-        "shabad_id": shabad_id,
-        "line": {k: line[k] for k in ("id", "line_no", "gurmukhi", "teeka_pa")},
-        "options": options,
-        "answer": line["translation_en"],
-    }
+    return {"shabad": dict(sh), "lines": lines, "learning": learning}
 
 
-@app.get("/api/learning/quiz/{line_id}")
+@app.post("/api/learning/{shabad_id}/practised")
+def mark_practised(shabad_id: int):
+    """Stamp the last-practised date. Informational -- nothing schedules on it."""
+    conn = library(write=True)
+    try:
+        with conn:
+            cur = conn.execute(
+                "UPDATE learning SET last_practised = datetime('now') WHERE shabad_id = ?",
+                (shabad_id,))
+        if not cur.rowcount:
+            raise HTTPException(404, "not being learned")
+    finally:
+        conn.close()
+    return {"shabad_id": shabad_id, "practised": True}
+
+
+@app.get("/api/quiz/{line_id}")
 def line_quiz(line_id: int):
-    """Meaning check for any single line -- same idea as the rahao gate."""
+    """Multiple choice: which English meaning belongs to this line?
+
+    Distractors are real translations of other lines, never invented ones -- so
+    a wrong answer is still Gurbani, and picking the right one means genuinely
+    telling two meanings apart.
+
+    Pulled from the most SIMILAR lines where vectors exist (§3): near-misses
+    force real discrimination, where four random lines from across the library
+    can usually be dismissed on subject alone.
+    """
     conn = library()
     try:
         line = conn.execute("SELECT * FROM lines WHERE id = ?", (line_id,)).fetchone()
         if not line:
             raise HTTPException(404, "no such line")
-        others = [r[0] for r in conn.execute(
-            """SELECT translation_en FROM lines
-               WHERE shabad_id <> ? AND translation_en IS NOT NULL AND translation_en <> ''
-               ORDER BY RANDOM() LIMIT 3""", (line["shabad_id"],))]
+
+        others = []
+        models = models_enabled(conn)
+        if models:
+            near = similar_for_model(conn, models[0]["name"], line_id, 40)
+            ids = [rid for rid, _, _ in near]
+            if ids:
+                ph = ",".join("?" * len(ids))
+                others = [r[0] for r in conn.execute(
+                    f"""SELECT translation_en FROM lines
+                        WHERE id IN ({ph}) AND shabad_id <> ?
+                          AND translation_en IS NOT NULL AND translation_en <> ''
+                        LIMIT 3""", (*ids, line["shabad_id"]))]
+
+        if len(others) < 3:                      # not indexed yet, or too few
+            others += [r[0] for r in conn.execute(
+                """SELECT translation_en FROM lines
+                   WHERE shabad_id <> ? AND translation_en IS NOT NULL
+                     AND translation_en <> '' ORDER BY RANDOM() LIMIT ?""",
+                (line["shabad_id"], 3 - len(others)))]
     finally:
         conn.close()
-    options = [line["translation_en"], *others]
+
+    options = [line["translation_en"], *others[:3]]
     random.shuffle(options)
-    return {"line_id": line_id, "options": options, "answer": line["translation_en"]}
-
-
-@app.post("/api/learning/{shabad_id}/gate")
-def pass_gate(shabad_id: int):
-    conn = library(write=True)
-    try:
-        with conn:
-            cur = conn.execute("UPDATE learning SET rahao_ok = 1 WHERE shabad_id = ?",
-                               (shabad_id,))
-        if not cur.rowcount:
-            raise HTTPException(404, "not being learned")
-    finally:
-        conn.close()
-    return {"shabad_id": shabad_id, "rahao_ok": True}
-
-
-def build_queue(conn, budget):
-    """Everything practisable right now, in the order it should be drilled.
-
-    THE single source of truth for "is anything due". The Learn tab used to
-    answer that with its own query, which counted brand-new lines the session
-    would then refuse once the daily new-material cap was spent -- so the tab
-    said "due" and pressing Start said "nothing due". Both now call this.
-
-    Scheduling is per SHABAD even though ease is tracked per line: when anything
-    in a shabad falls due the whole shabad surfaces and runs top to bottom. Pure
-    per-line scheduling scatters one shabad across five days, which is useless
-    for keertan where the flow is the thing.
-    """
-    used_today = conn.execute(
-        "SELECT COUNT(*) FROM learning_lines WHERE reps = 1 AND last_review = date('now')"
-    ).fetchone()[0]
-    allowance = max(0, NEW_LINES_PER_DAY - used_today)
-
-    rows = [dict(r) for r in conn.execute(
-        """SELECT ll.line_id, ll.shabad_id, ll.level, ll.due, ll.reps,
-                  l.line_no, l.gurmukhi, l.translation_en, l.teeka_pa, l.first_letters,
-                  s.source_line, s.source_line_no, lg.rahao_ok,
-                  (SELECT MIN(COALESCE(x.due, '9999')) FROM learning_lines x
-                   WHERE x.shabad_id = ll.shabad_id) shabad_due,
-                  (SELECT p.gurmukhi FROM lines p
-                   WHERE p.shabad_id = ll.shabad_id AND p.line_no = l.line_no - 1) prev_gurmukhi
-           FROM learning_lines ll
-           JOIN lines l ON l.id = ll.line_id
-           JOIN shabads s ON s.id = ll.shabad_id
-           JOIN learning lg ON lg.shabad_id = ll.shabad_id
-           WHERE ll.due IS NULL OR ll.due <= date('now')
-           ORDER BY shabad_due, ll.shabad_id, l.line_no""")]
-
-    queue, used_new = [], 0
-    for r in rows:
-        if r["due"] is None:                       # brand new line
-            if used_new >= allowance:
-                continue
-            used_new += 1
-        r["level_name"] = LEVELS[min(r["level"], MAX_LEVEL)]
-        queue.append(r)
-        if len(queue) >= budget:
-            break
-    return queue, allowance
-
-
-@app.get("/api/learning/session")
-def learning_session(budget: int = SESSION_LINES):
-    """Today's practice queue, capped at `budget` lines for a short daily burst."""
-    conn = library()
-    try:
-        full, allowance = build_queue(conn, 10_000)
-        queue = full[:max(1, budget)]
-    finally:
-        conn.close()
-    return {
-        "count": len(queue), "total": len(full),
-        "new_allowance": allowance, "levels": LEVELS,
-        "queue": queue,
-    }
-
-
-def review_line(body):
-    """Record one answer: reschedule it, and move it up or down the scaffold."""
-    if body.grade not in (0, 1, 2):
-        raise HTTPException(400, "grade must be 0, 1 or 2")
-
-    conn = library(write=True)
-    try:
-        row = conn.execute("SELECT * FROM learning_lines WHERE line_id = ?",
-                           (body.line_id,)).fetchone()
-        if not row:
-            raise HTTPException(404, "line is not being learned")
-
-        ease, interval, reps, lapsed = sm2(
-            row["ease"], row["interval_d"], row["reps"], body.grade)
-
-        # the scaffold moves separately from the schedule: getting it right earns
-        # a harder cue next time, blanking drops back to an easier one
-        level = row["level"]
-        if body.grade == 2:
-            level = min(MAX_LEVEL, level + 1)
-        elif body.grade == 0:
-            level = max(0, level - 1)
-
-        with conn:
-            conn.execute(
-                """UPDATE learning_lines
-                   SET level = ?, ease = ?, interval_d = ?, reps = ?,
-                       lapses = lapses + ?, last_review = date('now'),
-                       due = date('now', '+' || CAST(ROUND(?) AS INTEGER) || ' days')
-                   WHERE line_id = ?""",
-                (level, ease, interval, reps, 1 if lapsed else 0, interval, body.line_id))
-    finally:
-        conn.close()
-    return {"line_id": body.line_id, "level": level, "level_name": LEVELS[level],
-            "interval_days": round(interval, 1), "ease": round(ease, 2)}
+    return {"line_id": line_id, "gurmukhi": line["gurmukhi"],
+            "teeka_pa": line["teeka_pa"], "options": options,
+            "answer": line["translation_en"]}
 
 
 # --- searching BaniDB to add something new ----------------------------------
@@ -1514,6 +1916,13 @@ def preview(banidb_shabad_id: int):
 # (CLAUDE.md §7). Until that pass has run, these endpoints correctly return
 # nothing, and say why rather than returning a bare empty list.
 
+class IndexRequest(BaseModel):
+    # The ceiling the caller agreed to, in dollars. None means "use the server's
+    # own estimate" -- the client is never trusted to invent a larger number, it
+    # only ever echoes back the figure it was shown.
+    budget: Optional[float] = None
+
+
 class Relation(BaseModel):
     query_line_id: int
     result_line_id: int
@@ -1524,11 +1933,25 @@ class ModelPatch(BaseModel):
     enabled: bool
 
 
-# model -> (count_at_load, [line_id], matrix). 5,223 x 1024 float32 is ~21 MB
-# per model, far too much to read per request, so it is held in memory.
+# model -> (count_at_load, [line_id], matrix, checked_at). 5,530 x 1024 float32
+# is ~23 MB per model, far too much to read per request, so it is held in memory.
 # Invalidated by row count, which catches new rows; the indexing pass must call
 # clear_vector_cache() itself if it ever REPLACES vectors in place.
 _VECTORS = {}
+
+# How often the row count is actually re-checked.
+#
+# Measured: the count itself takes 15.5 ms while the similarity maths it guards
+# takes 0.7 ms -- twenty times the cost of the work. line_summaries is WITHOUT
+# ROWID, so the row IS the index entry, embedding included; there is no way to
+# count rows without paging 23 MB of vectors past the disk. No index helps.
+#
+# So it is checked on a timer instead. The only writer of vectors is the indexer,
+# a separate process, so the exposure is: for up to a minute after a run
+# finishes, similarity may not yet see the newest lines. That is invisible in
+# practice -- the page has to be reloaded to show them anyway -- and it makes
+# changing a filter cost a fraction of a millisecond instead of 16.
+VECTOR_RECHECK_S = 60
 
 
 def clear_vector_cache():
@@ -1536,10 +1959,15 @@ def clear_vector_cache():
 
 
 def _vectors_for(conn, model):
+    hit = _VECTORS.get(model)
+    now = time.monotonic()
+    if hit and now - hit[3] < VECTOR_RECHECK_S:
+        return hit[1], hit[2]
+
     n = conn.execute("SELECT COUNT(*) FROM line_summaries "
                      "WHERE model = ? AND embedding IS NOT NULL", (model,)).fetchone()[0]
-    hit = _VECTORS.get(model)
     if hit and hit[0] == n:
+        _VECTORS[model] = (n, hit[1], hit[2], now)      # unchanged; reset the clock
         return hit[1], hit[2]
     if not n:
         return [], None
@@ -1553,16 +1981,38 @@ def _vectors_for(conn, model):
                         dtype="<f4").reshape(len(ids), -1)
     # normalised once here, so every query is a plain dot product
     mat = mat / np.linalg.norm(mat, axis=1, keepdims=True)
-    _VECTORS[model] = (n, ids, mat)
+    _VECTORS[model] = (n, ids, mat, now)
     return ids, mat
 
 
-def similar_for_model(conn, model, line_id, limit):
-    """The `limit` nearest lines to `line_id` under one model, best first.
+def similar_for_model(conn, model, line_id, limit, allowed=None):
+    """The nearest lines to `line_id` under one model, best first.
 
     §7: RANK, never threshold. In 1024 dimensions unrelated vectors sit near
     perpendicular, so real scores bunch in a narrow band -- a hardcoded cutoff
     like `sim > 0.8` returns nothing at all. Sort and take the top N.
+
+    `allowed` is a set of line ids the filters permit. Filtering happens BEFORE
+    the slice, not after: the whole library is scored and ordered either way, so
+    taking the best `limit` OF THE MATCHING ONES costs nothing extra and always
+    returns a full page. Filtering the top 20 after the fact would instead return
+    however few of those 20 happened to match, and "show more" would be a
+    workaround for a self-inflicted problem.
+
+    Deliberately NO offset here. Paging belongs to the merged list, not to one
+    model: with an offset per model, a line that model A puts on page 2 can be
+    one model B already showed on page 1, and the same result appears twice.
+    Measured on a real query before this was moved -- page 2 repeated one row,
+    page 3 repeated three. The caller takes each model's top N and pages the
+    merge instead.
+
+    Returns (line_id, score, true_rank). `true_rank` is the position in the
+    UNFILTERED ordering, which is what model_results must record: a rank that
+    moved because a filter was on would make the model comparison depend on how
+    the reader happened to have the UI configured.
+
+    A full argsort of 5,530 costs 0.75 ms measured -- argpartition shaves 0.1 ms
+    and loses the true ranks, so the sort stays.
     """
     ids, mat = _vectors_for(conn, model)
     if mat is None or line_id not in ids:
@@ -1571,8 +2021,15 @@ def similar_for_model(conn, model, line_id, limit):
     i = ids.index(line_id)
     sims = mat @ mat[i]
     sims[i] = -9                                   # never match a line to itself
-    order = np.argsort(-sims)[:limit]
-    return [(ids[j], float(sims[j])) for j in order]
+
+    order = np.argsort(-sims)
+    ranks = np.empty(len(sims), dtype=np.int32)
+    ranks[order] = np.arange(len(sims))            # ranks[j] = j's place overall
+
+    if allowed is not None:
+        keep = np.fromiter((lid in allowed for lid in ids), bool, len(ids))
+        order = order[keep[order]]                 # drops rows, keeps the order
+    return [(ids[j], float(sims[j]), int(ranks[j])) for j in order[:limit]]
 
 
 class SettingPatch(BaseModel):
@@ -1623,8 +2080,39 @@ def list_models():
         conn.close()
 
 
+def request_stop():
+    """Ask any running indexer to stop, cooperatively.
+
+    Writes the flag file search/.index.stop. The indexer checks it after every
+    completed line and again after every saved chunk, so it stops within
+    seconds, having kept everything already bought and released its own lock.
+
+    Deliberately not a kill. The lock file holds the process id, but that id is
+    not trustworthy for this -- pids are recycled, and killing a recycled one
+    means killing something unrelated. A flag also stops it at a point of its own
+    choosing, which is the difference between losing the current chunk and
+    keeping it.
+    """
+    path = os.path.join(HERE, "search", ".index.stop")
+    try:
+        with open(path, "w", encoding="utf-8") as f:
+            f.write(datetime.datetime.now().isoformat(timespec="seconds"))
+        return True
+    except OSError as e:
+        print(f"could not write stop flag: {e}")
+        return False
+
+
 @app.patch("/api/models/{name}")
 def patch_model(name: str, body: ModelPatch):
+    """Switching a model off also stops any run indexing it.
+
+    These were separate actions and should not have been. Switching off already
+    means "stop spending on this"; leaving a run going that is doing exactly
+    that makes the switch a lie, and the only way to act on it was a terminal.
+    The reverse does not apply -- switching ON never starts anything by itself,
+    because that spends money and needs the priced confirmation first.
+    """
     conn = library(write=True)
     try:
         with conn:
@@ -1632,13 +2120,99 @@ def patch_model(name: str, body: ModelPatch):
                              (1 if body.enabled else 0, name)).rowcount
         if not n:
             raise HTTPException(404, f"no model named {name}")
-        return {"name": name, "enabled": body.enabled}
+
+        stopped = None
+        if not body.enabled:
+            job = next((j for j in live_jobs(conn) if j["model"] == name), None)
+            if job and request_stop():
+                stopped = {"done": job["done"], "total": job["total"],
+                           "spent": job["spent"]}
+        return {"name": name, "enabled": body.enabled, "stopped": stopped}
     finally:
         conn.close()
 
 
+@app.get("/api/models/{name}/estimate")
+def model_estimate(name: str):
+    """Priced before the switch is flipped, not after.
+
+    Switching a model on is the one action in this app that spends real money,
+    and the amount is not guessable from the UI -- it depends on how much of the
+    library that particular model has already done, which could be all of it or
+    none. So the number goes on screen before the decision, never after.
+    """
+    conn = library()
+    try:
+        return index_estimate(conn, name)
+    finally:
+        conn.close()
+
+
+@app.post("/api/models/{name}/index")
+def index_model(name: str, body: IndexRequest):
+    """Start a catch-up run for one model.
+
+    The ceiling is the estimate the user just approved plus 10%. The margin
+    exists so the run isn't cut off a few lines short by rounding or a small
+    price move; the ceiling itself exists so that a LARGE price move cannot turn
+    an agreed $3.75 into something else entirely. Consent was given to a number,
+    and the number is enforced.
+    """
+    conn = library()
+    try:
+        est = index_estimate(conn, name)
+    finally:
+        conn.close()
+    if not est["unique"]:
+        return {**est, "started": False, "reason": "nothing outstanding"}
+    if est["busy"]:
+        return {**est, "started": False, "reason": "indexing already running"}
+
+    # The server's own estimate is the cap. A caller may ask for LESS -- index a
+    # dollar's worth and see how it goes -- but never for more, so the ceiling
+    # can't be widened by editing the request. With no live price to work from,
+    # fall back to the small automatic allowance rather than running uncapped:
+    # spending too little is recoverable, spending too much is not.
+    ceiling = est["cost"] or AUTO_INDEX_BUDGET
+    budget = min(body.budget, ceiling) if body.budget else ceiling
+    budget = round(budget * 1.10, 4)
+    spawn_indexer(model=name, budget=budget)
+    return {**est, "started": True, "budget": budget}
+
+
+def models_enabled(conn):
+    return [m for m in model_rows(conn) if m["enabled"]]
+
+
+def allowed_line_ids(conn, status, rarity, genre, speed, raag, writer, length):
+    """Line ids whose shabad passes the filters, or None if none are set.
+
+    Built with filter_clauses, the same function the library list and the deck
+    use, so a filter cannot mean one thing on one screen and something else on
+    another. None rather than "every id" on purpose: it lets the caller skip
+    building a 5,530-element mask in the common case where nothing is filtered.
+    """
+    where, args = filter_clauses(status, rarity, genre, speed, raag, writer, length)
+    if not where:
+        return None
+    return {r[0] for r in conn.execute(
+        f"""SELECT l.id FROM lines l JOIN shabads s ON s.id = l.shabad_id
+            WHERE {' AND '.join(where)}""", args)}
+
+
 @app.get("/api/similar/{line_id}")
-def get_similar(line_id: int, limit: int = SIMILAR_LIMIT):
+def get_similar(
+    line_id: int,
+    limit: int = SIMILAR_LIMIT,
+    offset: int = 0,
+    status: Optional[List[str]] = Query(None),
+    rarity: Optional[List[str]] = Query(None),
+    genre: Optional[List[str]] = Query(None),
+    speed: Optional[List[str]] = Query(None),
+    raag: Optional[List[str]] = Query(None),
+    writer: Optional[List[str]] = Query(None),
+    length: Optional[List[str]] = Query(None),
+):
     """Lines related in meaning to this one, merged across enabled models.
 
     One row per RESULT LINE, never one per model: a line three models returned
@@ -1668,16 +2242,39 @@ def get_similar(line_id: int, limit: int = SIMILAR_LIMIT):
         if not q:
             raise HTTPException(404, "no such line")
 
-        models = [m for m in model_rows(conn) if m["enabled"]]
+        allowed = allowed_line_ids(conn, status, rarity, genre, speed,
+                                   raag, writer, length)
+        # A filter combination nothing matches is not the same as an unindexed
+        # line, and saying "not indexed yet" there would send you off to run the
+        # indexer over a library that is already complete.
+        if allowed is not None and not allowed:
+            return {"query": dict(q), "results": [], "models": models_enabled(conn),
+                    "reason": "no match", "more": False}
+
+        models = models_enabled(conn)
+        # Each model's top (offset+limit+1), then page the MERGE. Any line in the
+        # true merged top-N must be in some model's own top-N, so this prefix is
+        # complete; the +1 is what makes "is there a next page" answerable
+        # without counting the whole matching set.
+        need = offset + limit + 1
         merged = {}
         for m in models:
-            for rank, (rid, score) in enumerate(
-                    similar_for_model(conn, m["name"], line_id, limit)):
+            for rid, score, rank in similar_for_model(
+                    conn, m["name"], line_id, need, allowed):
                 merged.setdefault(rid, {})[m["name"]] = {"rank": rank, "score": score}
 
-        if not merged:
+        ordered = sorted(merged.items(),
+                         key=lambda kv: (-max(v["score"] for v in kv[1].values()),
+                                         min(v["rank"] for v in kv[1].values())))
+        more = len(ordered) > offset + limit
+        page = ordered[offset:offset + limit]
+
+        if not page:
+            # Past the end of the list is an ordinary outcome of Show more, not
+            # a fault. Only an empty FIRST page means nothing has been indexed.
             return {"query": dict(q), "results": [], "models": models,
-                    "reason": "not indexed yet"}
+                    "reason": "not indexed yet" if not offset else "no more",
+                    "more": False}
 
         rows = {r["id"]: dict(r) for r in conn.execute(
             f"""SELECT l.id, l.gurmukhi, l.translation_en, l.teeka_pa, l.line_no,
@@ -1686,25 +2283,30 @@ def get_similar(line_id: int, limit: int = SIMILAR_LIMIT):
                        (SELECT COUNT(*) FROM lines x WHERE x.shabad_id = s.id)
                          AS line_count
                 FROM lines l JOIN shabads s ON s.id = l.shabad_id
-                WHERE l.id IN ({','.join('?' * len(merged))})""", tuple(merged))}
+                WHERE l.id IN ({','.join('?' * len(page))})""",
+            tuple(rid for rid, _ in page))}
 
         verdicts = {r["result_line_id"]: r["verdict"] for r in conn.execute(
             "SELECT result_line_id, verdict FROM line_relations WHERE query_line_id = ?",
             (line_id,))}
 
+        # Only what was actually put in front of me, at its true unfiltered rank.
+        # Recording the whole prefix would credit models for results this page
+        # never showed.
         with conn:
             conn.executemany(
                 "INSERT OR REPLACE INTO model_results "
                 "(query_line_id, result_line_id, model, rank) VALUES (?,?,?,?)",
                 [(line_id, rid, name, d["rank"])
-                 for rid, by in merged.items() for name, d in by.items()])
+                 for rid, by in page for name, d in by.items()])
 
+        # `page` is already in merged order; do not re-sort.
         results = [{**rows[rid], "by": by, "verdict": verdicts.get(rid, 0),
                     "score": max(v["score"] for v in by.values()),
                     "best_rank": min(v["rank"] for v in by.values())}
-                   for rid, by in merged.items() if rid in rows]
-        results.sort(key=lambda r: (-r["score"], r["best_rank"]))
-        return {"query": dict(q), "results": results, "models": models, "reason": None}
+                   for rid, by in page if rid in rows]
+        return {"query": dict(q), "results": results, "models": models,
+                "reason": None, "more": more, "offset": offset}
     finally:
         conn.close()
 

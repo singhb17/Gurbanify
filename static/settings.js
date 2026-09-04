@@ -18,8 +18,26 @@ async function loadPrefs() {
   try {
     const s = (await api('/api/settings')).settings;
     $('set-auto-index').checked = s.auto_index === '1';
-  } catch { /* the toggle just stays as it is */ }
+    $('set-wake-lock').checked = s.wake_lock === '1';
+  } catch { /* the toggles just stay as they are */ }
 }
+
+$('set-wake-lock').onchange = async (e) => {
+  const on = e.target.checked;
+  // Apply first, save second. The lock is what the switch is FOR, and it should
+  // take effect on the tap rather than after a round trip.
+  setWakeLock(on);
+  try {
+    await api('/api/settings/wake_lock', json('PATCH', { value: on ? '1' : '0' }));
+    const st = wakeStatus();
+    toast(on ? (st.state === 'active' ? 'Screen will stay awake' : st.detail)
+             : 'Screen can sleep normally', on && st.state !== 'active');
+  } catch (err) {
+    setWakeLock(!on);
+    e.target.checked = !on;
+    toast('Could not save that: ' + err.message, true);
+  }
+};
 
 $('set-auto-index').onchange = async (e) => {
   const on = e.target.checked;
@@ -54,19 +72,151 @@ async function loadModelToggles() {
     </label>`).join('');
 }
 
+/* Switching OFF is free and instant. Switching ON may cost money, so it goes
+ * through the estimate dialog first -- see confirmEnable below. */
 $('set-models').addEventListener('change', async (e) => {
   const box = e.target.closest('input[data-model]');
   if (!box) return;
-  try {
-    await api('/api/models/' + encodeURIComponent(box.dataset.model),
-              json('PATCH', { enabled: box.checked }));
-    toast(box.checked ? 'Model switched on' : 'Model switched off');
-    loadScores();            // the unique counts depend on who is active
-  } catch (err) {
-    box.checked = !box.checked;               // put the switch back
-    toast('Could not change that: ' + err.message, true);
-  }
+  if (box.checked) return confirmEnable(box);
+  await setEnabled(box, false);
 });
+
+async function setEnabled(box, on) {
+  try {
+    const r = await api('/api/models/' + encodeURIComponent(box.dataset.model),
+                        json('PATCH', { enabled: on }));
+    box.checked = on;
+    // Switching off doubles as the stop switch: if a run was indexing this
+    // model, it has just been asked to stop. Say so with the numbers, because
+    // "switched off" alone would hide the more consequential half.
+    if (r.stopped) {
+      toast(`Switched off — stopping indexing at ${r.stopped.done.toLocaleString()}`
+            + ` of ${r.stopped.total.toLocaleString()}`
+            + ` ($${r.stopped.spent.toFixed(2)} spent)`);
+    } else {
+      toast(on ? 'Model switched on' : 'Model switched off');
+    }
+    loadScores();            // the unique counts depend on who is active
+    return true;
+  } catch (err) {
+    box.checked = !on;                        // put the switch back
+    toast('Could not change that: ' + err.message, true);
+    return false;
+  }
+}
+
+/* Price the catch-up, then ask.
+ *
+ * The checkbox is put BACK to off for the duration. A switch that shows "on"
+ * while a dialog is still asking whether to switch it on is lying about the
+ * state of the system, and if the dialog is dismissed by tapping outside or
+ * pressing Escape -- neither of which runs any handler of ours -- it would stay
+ * lying. Reverting first means the visible state is always the true one, and
+ * the confirm path is the only thing that can change it.
+ */
+let enablePending = null;
+
+async function confirmEnable(box) {
+  box.checked = false;
+  const name = box.dataset.model;
+  const dlg = $('enable-dialog');
+  $('enable-body').innerHTML = '<p class="muted">Working out what that would cost…</p>';
+  $('en-go').disabled = true;
+  if (!dlg.open) dlg.showModal();
+
+  let est;
+  try {
+    est = await api('/api/models/' + encodeURIComponent(name) + '/estimate');
+  } catch (err) {
+    $('enable-body').innerHTML =
+      `<p class="muted">Could not work out the cost: ${esc(err.message)}</p>`;
+    return;
+  }
+
+  // Nothing outstanding: this model has already done every line. No spend, no
+  // decision to make, so don't manufacture one.
+  if (!est.unique) {
+    dlg.close();
+    await setEnabled(box, true);
+    return;
+  }
+
+  enablePending = { box, name, est };
+  const short = est.cost !== null && est.balance !== null && est.balance < est.cost;
+  const doneLines = Math.max(0, est.total - est.lines);
+  const pct = est.total ? Math.round((doneLines / est.total) * 100) : 0;
+
+  // Three numbers, because three is what the decision actually needs: how much
+  // work, what it costs, what you have. The prose version said the same thing in
+  // four sentences and was slower to read.
+  $('enable-body').innerHTML = `
+    <div class="en-head">
+      <b>${esc(nameOf(name))}</b>
+      <span class="muted mono">${esc(name)}</span>
+    </div>
+
+    <div class="en-bar" role="img"
+         aria-label="${pct}% of the library indexed by this model">
+      <span style="width:${pct}%"></span>
+    </div>
+    <div class="en-bar-label">
+      <span>${doneLines.toLocaleString()} indexed</span>
+      <span>${est.lines.toLocaleString()} to go</span>
+    </div>
+
+    <div class="en-stats">
+      <div class="en-stat">
+        <b>${est.unique.toLocaleString()}</b>
+        <span>to summarise</span>
+      </div>
+      <div class="en-stat">
+        <b>${est.cost === null ? '&mdash;' : '$' + est.cost.toFixed(2)}</b>
+        <span>estimated</span>
+      </div>
+      <div class="en-stat${short ? ' low' : ''}">
+        <b>${est.balance === null ? '&mdash;' : '$' + est.balance.toFixed(2)}</b>
+        <span>your credit</span>
+      </div>
+    </div>
+
+    ${est.cost === null ? `<p class="warn">Price list unreachable &mdash; this will
+       stop at the $0.25 automatic allowance rather than guess.</p>` : ''}
+    ${short ? `<p class="warn"><b>$${(est.cost - est.balance).toFixed(2)} short.</b>
+       It indexes what it can afford, then stops. Run it again later to carry on.</p>` : ''}
+    ${est.busy ? `<p class="warn">Indexing already running &mdash; the catch-up
+       starts on the next run.</p>` : ''}
+
+    <p class="en-foot muted">${est.unique.toLocaleString()} unique of
+      ${est.lines.toLocaleString()} &mdash; repeated tuks are summarised once.
+      Runs in the background, resumes if interrupted.</p>`;
+  $('en-go').disabled = false;
+}
+
+function nameOf(name) {
+  const box = $('set-models').querySelector(`input[data-model="${CSS.escape(name)}"]`);
+  return box ? box.closest('.set-row').querySelector('b').textContent : name;
+}
+
+$('en-go').onclick = async () => {
+  const p = enablePending;
+  $('enable-dialog').close();
+  if (!p) return;
+  if (!await setEnabled(p.box, true)) return;
+  try {
+    // budget: echo back exactly the figure that was on screen. The server caps
+    // it to its own estimate regardless, so this can only ever ask for less.
+    const r = await api('/api/models/' + encodeURIComponent(p.name) + '/index',
+                        json('POST', { budget: p.est.cost }));
+    toast(r.started ? 'Catching up in the background…'
+                    : 'Switched on. ' + (r.reason || 'Nothing to index.'));
+  } catch (err) {
+    toast('Switched on, but indexing did not start: ' + err.message, true);
+  }
+};
+
+$('en-cancel').onclick = () => $('enable-dialog').close();
+$('en-close').onclick = () => $('enable-dialog').close();
+$('enable-dialog').addEventListener('close', () => { enablePending = null; });
 
 async function loadScores() {
   let data;

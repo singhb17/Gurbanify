@@ -78,34 +78,30 @@ def rows_for_export(conn):
     return out
 
 
-# Memorization progress: one row per line, not per shabad, so it can't share the
-# Notion sheet. Keyed on BaniDbVerseId rather than the text -- that id is stable
-# in BaniDB, so progress survives even a full rebuild of the library, which
-# matching on a line's wording would not.
-LEARNING_COLUMNS = ["BaniDbVerseId", "Shabad", "LineNo", "Gurmukhi", "Level",
-                    "Ease", "IntervalDays", "Due", "Reps", "Lapses",
-                    "LastReviewed", "ShabadStage", "RahaoPassed", "AddedAt"]
+# What I'm memorising: one row per shabad. Keyed on BaniDbShabadId rather than
+# the text -- that id is stable in BaniDB, so the list survives even a full
+# rebuild of the library, which matching on wording would not.
+#
+# This used to be one row per LINE with SM-2 state -- level, ease, interval,
+# due date. That scheduling layer was removed (it went unused), so there is far
+# less to preserve: which shabads, and when each was last practised.
+LEARNING_COLUMNS = ["BaniDbShabadId", "Shabad", "Lines", "AddedAt", "LastPractised"]
 
 
 def learning_rows(conn):
     """Empty list on databases predating the memorization feature."""
     try:
         cur = conn.execute("""
-            SELECT l.banidb_verse_id, s.source_line, l.line_no, l.gurmukhi,
-                   ll.level, ll.ease, ll.interval_d, ll.due, ll.reps, ll.lapses,
-                   ll.last_review, lg.rahao_ok, lg.added_at
-            FROM learning_lines ll
-            JOIN lines l   ON l.id = ll.line_id
-            JOIN shabads s ON s.id = ll.shabad_id
-            JOIN learning lg ON lg.shabad_id = ll.shabad_id
-            ORDER BY ll.shabad_id, l.line_no""")
+            SELECT s.banidb_shabad_id, s.source_line,
+                   (SELECT COUNT(*) FROM lines l WHERE l.shabad_id = s.id),
+                   lg.added_at, lg.last_practised
+            FROM learning lg JOIN shabads s ON s.id = lg.shabad_id
+            ORDER BY lg.added_at""")
     except sqlite3.OperationalError:
         return []
     return [{
-        "BaniDbVerseId": r[0] or "", "Shabad": r[1], "LineNo": r[2], "Gurmukhi": r[3],
-        "Level": r[4], "Ease": round(r[5], 3), "IntervalDays": round(r[6], 1),
-        "Due": r[7] or "", "Reps": r[8], "Lapses": r[9], "LastReviewed": r[10] or "",
-        "ShabadStage": "", "RahaoPassed": "Yes" if r[11] else "", "AddedAt": r[12],
+        "BaniDbShabadId": r[0] or "", "Shabad": r[1], "Lines": r[2],
+        "AddedAt": r[3] or "", "LastPractised": r[4] or "",
     } for r in cur]
 
 

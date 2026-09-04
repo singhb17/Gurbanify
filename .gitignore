@@ -25,6 +25,11 @@ search/cache/vectors.pkl
 search/out/
 search/index.log
 search/.index.lock
+search/.index.stop
+
+# Runtime logs from serve.ps1 / watchdog.ps1, and the tunnel url they record.
+# current-url.txt is a live public address -- it does not belong in a repo.
+logs/
 
 # BLOB dumps written by SQLite viewer extensions when you click an embedding.
 # Each is a copy of one vector that is already in the database.

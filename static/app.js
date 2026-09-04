@@ -4,7 +4,18 @@ const $ = (id) => document.getElementById(id);
 const esc = (s) => String(s ?? '').replace(/[&<>"]/g, (c) =>
   ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;' }[c]));
 
-const FILTER_KINDS = ['status', 'rarity', 'genre', 'speed', 'raag', 'writer'];
+// Two tiers. The basic four plus length are what an actual choice gets made on;
+// raag and writer are real filters that are almost never the question, and
+// leaving them in the open turns the panel into a wall you scroll past. Behind
+// a disclosure they cost nothing until wanted.
+//
+// `length` is a BASIC filter and a server-defined one -- its bands and their
+// boundaries come from /api/filters, so the UI never hardcodes where "Short"
+// ends. Multi-select makes one control cover caps, minimums and bands alike:
+// short+medium is "at most 16", medium+long is "at least 9".
+const BASIC_KINDS = ['status', 'rarity', 'genre', 'speed', 'length'];
+const ADVANCED_KINDS = ['raag', 'writer'];
+const FILTER_KINDS = [...BASIC_KINDS, ...ADVANCED_KINDS];
 // mode must match the <option selected> in index.html
 const state = { filters: {}, options: {}, q: '', sort: 'id', mode: 'firstletter' };
 
@@ -132,7 +143,7 @@ const json = (method, body) => ({
 });
 
 const VIEWS = ['list', 'detail', 'deck', 'saved', 'learn', 'practice', 'history', 'add',
-               'similar', 'settings'];
+               'similar', 'settings', 'status'];
 
 // The deck sizes itself to the window, so it needs the header's real height.
 // Hardcoding it would be wrong on one screen or the other: the nav wraps onto a
@@ -148,7 +159,10 @@ function show(view) {
                           ['nav-saved', 'saved'], ['nav-learn', 'learn'],
                           ['nav-history', 'history'], ['nav-add', 'add'],
                           ['nav-settings', 'settings']])
-    $(btn).classList.toggle('active', view === v);
+    // the control panel is reached through Settings and has no button of its
+    // own, so the gear stays lit while you are in there
+    $(btn).classList.toggle('active', view === v
+                            || (v === 'settings' && view === 'status'));
   // stops the page itself scrolling behind the deck -- the card scrolls instead
   document.body.classList.toggle('deck-view', view === 'deck');
   measureHeader();          // the deck sizes to it, and the detail bar sticks below it
@@ -160,15 +174,36 @@ function show(view) {
 // One chip renderer for both the library and the deck. `filters` is the object
 // the chips mutate, so each view keeps its own selection -- narrowing the
 // library must not silently change what the deck is drawing from.
-function renderChips(container, filters, onChange) {
-  $(container).innerHTML = FILTER_KINDS.map((kind) => {
+// An option is either a bare string, or {value,label,count} for kinds where
+// what you post back isn't what you read -- length posts "short" and reads
+// "Short 1–8". Both shapes go through one renderer so no kind needs its own.
+const optValue = (v) => (typeof v === 'string' ? v : v.value);
+const optLabel = (v) => (typeof v === 'string' ? v : v.label);
+
+function chipGroup(kinds, filters) {
+  return kinds.map((kind) => {
     const vals = state.options[kind] || [];
     if (!vals.length) return '';
     return `<div class="chips"><b>${kind}</b>` + vals.map((v) => {
-      const on = (filters[kind] || []).includes(v) ? ' on' : '';
-      return `<button class="chip${on}" data-kind="${kind}" data-val="${esc(v)}">${esc(v)}</button>`;
+      const val = optValue(v);
+      const on = (filters[kind] || []).includes(val) ? ' on' : '';
+      const n = (v && v.count != null) ? `<span class="chip-n">${v.count}</span>` : '';
+      return `<button class="chip${on}" data-kind="${kind}"
+                data-val="${esc(val)}">${esc(optLabel(v))}${n}</button>`;
     }).join('') + '</div>';
   }).join('');
+}
+
+function renderChips(container, filters, onChange) {
+  // If an advanced filter is active it must not also be hidden -- a raag set
+  // last week silently narrowing today's results, with nothing on screen
+  // explaining why, is the worst kind of bug: everything looks correct.
+  const advN = ADVANCED_KINDS.reduce((n, k) => n + (filters[k] || []).length, 0);
+  $(container).innerHTML = chipGroup(BASIC_KINDS, filters) + `
+    <details class="adv"${advN ? ' open' : ''}>
+      <summary>Advanced filters${advN ? `<span class="fcount">${advN}</span>` : ''}</summary>
+      ${chipGroup(ADVANCED_KINDS, filters)}
+    </details>`;
 
   $(container).onclick = (e) => {
     const chip = e.target.closest('.chip');
@@ -178,6 +213,13 @@ function renderChips(container, filters, onChange) {
     const i = set.indexOf(val);
     if (i < 0) set.push(val); else set.splice(i, 1);
     chip.classList.toggle('on', i < 0);
+    // Repaint the advanced badge without rebuilding the panel, which would
+    // collapse the disclosure the moment you used it.
+    const badge = $(container).querySelector('.adv > summary .fcount');
+    const n = ADVANCED_KINDS.reduce((a, k) => a + (filters[k] || []).length, 0);
+    if (badge) badge.textContent = n || '';
+    else if (n) $(container).querySelector('.adv > summary')
+      .insertAdjacentHTML('beforeend', `<span class="fcount">${n}</span>`);
     onChange();
   };
 }
@@ -193,11 +235,14 @@ function filterParams(filters, p = new URLSearchParams()) {
   return p;
 }
 
-// keeps the collapsed "Filters" summary honest about what's hidden inside it
-function paintFilterCount() {
-  const n = countFilters(state.filters);
-  $('lib-filter-count').textContent = n ? String(n) : '';
-  $('f-clear').disabled = !n;
+// keeps the collapsed "Filters" summary honest about what's hidden inside it.
+// Defaults are the library's, so the three panels share one implementation
+// without every existing caller having to name them.
+function paintFilterCount(badgeId = 'lib-filter-count', filters = state.filters,
+                          clearId = 'f-clear') {
+  const n = countFilters(filters);
+  $(badgeId).textContent = n ? String(n) : '';
+  if (clearId && $(clearId)) $(clearId).disabled = !n;
 }
 
 async function loadFilters() {
@@ -371,6 +416,7 @@ const ROUTES = {
   // Inside an arrow the name is looked up when the route runs, by which time
   // both files have loaded.
   settings: { path: '/settings',   load: () => loadSettings() },
+  status:   { path: '/status',     load: () => loadStatus() },
   practice: { path: '/practice',   load: null },       // only entered via Start
   detail:   { path: null,          load: null },       // /shabad/<id>
   similar:  { path: null,          load: (st) => loadSimilar(st.id) },  // /similar/<line_id>
@@ -961,8 +1007,17 @@ async function loadSaved() {
 }
 
 // ---------- memorization ----------
+//
+// A list, and three ways to test yourself on one shabad. No schedule, no
+// levels, no gates, no daily caps, no streaks.
+//
+// There was a full SM-2 implementation here. It worked and it went unused: the
+// scheduling was what killed it, because being told what to practise and when
+// turns a thing you want to do into a thing you are behind on. What replaced it
+// gives you the same drills with none of the bookkeeping -- open a shabad you
+// are learning, pick a mode, go at your own pace, stop whenever.
 
-const practice = { queue: [], i: 0, gated: new Set(), t0: 0, tick: null, answered: 0 };
+const practice = { shabad: null, lines: [], i: 0, mode: 'letters' };
 
 // Case is ignored on purpose. In the encoding B is ਭ and b is ਬ, but that's an
 // encoding detail -- the thing being tested is whether the sequence of words is
@@ -971,276 +1026,223 @@ const normLetters = (s) => String(s || '').replace(/[^a-z]/gi, '').toLowerCase()
 
 async function refreshLearnBadge() {
   try {
-    const s = await api('/api/learning/session?budget=1');
-    $('learn-due').textContent = s.total > 0 ? s.total : '';
-    // On a phone the nav is collapsed, so a badge inside it is invisible until
-    // you go looking. Mark the menu button itself when there's practice waiting.
-    $('nav-toggle').classList.toggle('has-due', s.total > 0);
+    const d = await api('/api/learning');
+    // Counts what is not finished, not the whole list -- a badge that never
+    // goes down as you learn things is just a total wearing a badge's clothes.
+    const left = (d.counts.not_started || 0) + (d.counts.in_progress || 0);
+    $('learn-due').textContent = left > 0 ? left : '';
   } catch { /* badge only */ }
 }
 
-async function loadLearn() {
-  const d = await api('/api/learning');
-  const due = d.shabads.filter((s) => s.due).length;
-  $('learn-title').textContent = `Memorizing (${d.count})`;
+// Set by hand, never derived. Nothing measures your recall any more, so you are
+// the only thing that can say where a shabad has got to.
+const LEARN_STATES = [
+  { id: 'not_started', label: 'Not started', cls: 'red' },
+  { id: 'in_progress', label: 'In progress', cls: 'amber' },
+  { id: 'memorized',   label: 'Memorized',   cls: 'green' },
+];
+const learnState = (id) => LEARN_STATES.find((s) => s.id === id) || LEARN_STATES[0];
 
-  // "nothing due" has three quite different meanings -- say which one it is
-  let sub = '';
-  if (d.due_lines) {
-    sub = `${d.due_lines} line${d.due_lines === 1 ? '' : 's'} across `
-        + `${due} shabad${due === 1 ? '' : 's'} ready to practise`;
-  } else if (d.new_waiting && !d.new_allowance) {
-    sub = `Daily new-material cap reached — ${d.new_waiting} new `
-        + `line${d.new_waiting === 1 ? '' : 's'} unlock tomorrow. `
-        + `Adding faster than you consolidate is how shabads get half-learned.`;
-  } else if (d.count) {
-    sub = d.next_due ? `All caught up — next review ${d.next_due}`
-                     : 'All caught up';
-  }
-  $('learn-sub').textContent = sub;
-  $('learn-start').disabled = !d.due_lines;
+let learnFilter = null;          // null = show everything
+
+async function loadLearn() {
+  const p = new URLSearchParams();
+  if (learnFilter) p.set('status', learnFilter);
+  const d = await api('/api/learning?' + p);
+
+  $('learn-title').textContent = `Memorizing (${d.total})`;
+  $('learn-sub').textContent = d.total
+    ? 'Tap one to practise it. Nothing is scheduled — go whenever you like.' : '';
+
+  // Filter chips double as the tally, so the split is visible without counting.
+  $('learn-filters').innerHTML = [
+    { id: null, label: 'All', cls: '', n: d.total },
+    ...LEARN_STATES.map((s) => ({ ...s, n: d.counts[s.id] || 0 })),
+  ].map((s) => `
+    <button class="chip learn-chip ${s.cls}${learnFilter === s.id ? ' on' : ''}"
+            data-status="${s.id === null ? '' : s.id}">
+      ${esc(s.label)}<span class="chip-n">${s.n}</span>
+    </button>`).join('');
 
   $('learn-list').innerHTML = d.count ? d.shabads.map((s) => {
-    const p = s.progress || { percent: 0, lines: 0, reviews: 0 };
+    const st = learnState(s.learn_status);
     return `
-    <div class="card learn-card${s.due ? ' due' : ''}" data-id="${s.id}">
+    <div class="card learn-card st-${st.cls}" data-id="${s.id}">
       <div class="card-main">
         <div class="gurmukhi">${esc(s.source_line)}</div>
         <div class="en">${esc(s.source_translation || '')}</div>
-        <div class="bar"><span style="width:${p.percent}%"></span></div>
       </div>
       <div class="card-side">
-        <div class="tags-row">
-          <span class="tag t-${s.stage === 'Maintenance' ? 'green'
-            : s.stage === 'Memorised' ? 'green'
-            : s.stage === 'Consolidating' ? 'blue'
-            : s.stage === 'Understanding' ? 'orange' : 'gray'}">${esc(s.stage)}</span>
-          ${s.rahao_ok ? '' : '<span class="tag t-orange">meaning check due</span>'}
-        </div>
+        <select class="learn-status ${st.cls}" data-id="${s.id}"
+                aria-label="How well do you know this?">
+          ${LEARN_STATES.map((o) => `<option value="${o.id}"${
+            o.id === st.id ? ' selected' : ''}>${o.label}</option>`).join('')}
+        </select>
         <div class="meta">
-          <span>${p.percent}% · ${p.lines} lines</span>
-          <span>${p.reviews} reviews</span>
-          ${s.due ? '<span class="due-flag">due</span>'
-                  : p.next_due ? `<span>next ${esc(p.next_due)}</span>` : ''}
+          <span>${s.line_count} lines</span>
+          <span>${s.last_practised ? 'practised ' + whenLabel(s.last_practised)
+                                    : 'not practised yet'}</span>
         </div>
       </div>
       <div class="card-btns">
         <button class="unlearn secondary" data-id="${s.id}"
-                title="Stop memorizing">&times;</button>
+                title="Remove from the list">&times;</button>
       </div>
     </div>`;
   }).join('')
-    : `<p class="muted">Nothing here yet. Open a shabad and press
-       <b>Learn</b> to start memorizing it.</p>`;
+    : `<p class="muted">${learnFilter
+        ? 'Nothing with that status.'
+        : 'Nothing here yet. Open a shabad and press <b>Learn</b> to add it.'}</p>`;
+
+  $('learn-filters').onclick = (e) => {
+    const chip = e.target.closest('.learn-chip');
+    if (!chip) return;
+    learnFilter = chip.dataset.status || null;
+    loadLearn();
+  };
+
+  // change, not click: a <select> inside a tappable card must not also open it
+  $('learn-list').onchange = async (e) => {
+    const sel = e.target.closest('.learn-status');
+    if (!sel) return;
+    try {
+      await api('/api/learning/' + sel.dataset.id,
+                json('PATCH', { status: sel.value }));
+      loadLearn();
+    } catch (err) {
+      toast('Could not save that: ' + err.message, true);
+      loadLearn();
+    }
+  };
 
   $('learn-list').onclick = async (e) => {
+    if (e.target.closest('.learn-status')) return;      // the dropdown, not the card
     const drop = e.target.closest('.unlearn');
     if (drop) {
       e.stopPropagation();
-      if (!confirm('Stop memorizing this shabad?\n\nAll its progress — levels, '
-                 + 'review history, schedule — is deleted and cannot be recovered.')) return;
+      // No confirm: there is no progress to lose any more, just a list entry,
+      // and adding it back is one tap.
       try {
         await api('/api/learning/' + drop.dataset.id, { method: 'DELETE' });
-        toast('Removed from Learning');
+        toast('Removed from Memorizing');
         loadLearn(); refreshLearnBadge();
       } catch (err) { toast(err.message, true); }
       return;
     }
     const card = e.target.closest('.card');
-    if (card) go('detail', { id: card.dataset.id });
+    if (card) startPractice(card.dataset.id);
   };
 }
 
-// ---- the practice session ----
+// ---- practising one shabad ----
 
-async function startPractice() {
+async function startPractice(shabadId) {
   try {
-    const s = await api('/api/learning/session');
-    if (!s.count) { toast('Nothing due right now'); return; }
-    practice.queue = s.queue;
+    const d = await api('/api/learning/' + shabadId + '/lines');
+    practice.shabad = d.shabad;
+    practice.lines = d.lines;
     practice.i = 0;
-    practice.answered = 0;
-    practice.gated = new Set();
-    practice.t0 = Date.now();
-    clearInterval(practice.tick);
-    practice.tick = setInterval(paintTimer, 1000);
     go('practice');
     renderPractice();
+    // Stamping it here, not at the end: opening it IS practising it, and a
+    // stamp that only lands if you reach the last line would under-report.
+    api('/api/learning/' + shabadId + '/practised', json('POST', {})).catch(() => {});
   } catch (err) { toast(err.message, true); }
 }
 
-function paintTimer() {
-  const s = Math.floor((Date.now() - practice.t0) / 1000);
-  $('practice-timer').textContent =
-    `${String(Math.floor(s / 60)).padStart(2, '0')}:${String(s % 60).padStart(2, '0')}`;
-}
-
-function endPractice() {
-  clearInterval(practice.tick);
-  const mins = Math.max(1, Math.round((Date.now() - practice.t0) / 60000));
-  const n = practice.answered;
-  go('learn');
-  refreshLearnBadge();
-  if (n) toast(`${n} line${n === 1 ? '' : 's'} in ${mins} min`);
+function setMode(mode) {
+  practice.mode = mode;
+  for (const b of $('view-practice').querySelectorAll('.mode-btn'))
+    b.classList.toggle('on', b.dataset.mode === mode);
+  renderPractice();
 }
 
 function renderPractice() {
-  const item = practice.queue[practice.i];
-  if (!item) { endPractice(); return; }
+  if (!practice.lines.length) { $('practice').innerHTML = ''; return; }
+  if (practice.mode === 'perform') return renderPerform();
 
-  $('practice-progress').textContent = `${practice.i + 1} of ${practice.queue.length}`;
-
-  // The meaning gate comes before any drilling of a shabad's lines: understand
-  // the rahao, and the rest of the shabad unlocks (CLAUDE.md §3).
-  if (!item.rahao_ok && !practice.gated.has(item.shabad_id)) {
-    renderGate(item.shabad_id);
-    return;
-  }
-  renderDrill(item);
+  const item = practice.lines[practice.i];
+  $('practice-progress').textContent = `${practice.i + 1} of ${practice.lines.length}`;
+  if (practice.mode === 'meaning') return renderMeaning(item);
+  return renderLetters(item);
 }
 
-async function renderGate(shabadId) {
-  let g;
-  try { g = await api('/api/learning/gate/' + shabadId); }
-  catch (err) { toast(err.message, true); practice.gated.add(shabadId); renderPractice(); return; }
+// Always available, never forced. Prev works from the first line (wraps to the
+// end) because there is no "correct" direction through a shabad you are
+// revising -- sometimes you want the line before the one you just fluffed.
+function practiceNav(extra = '') {
+  return `
+    <div class="drill-nav">
+      <button id="pr-prev" class="secondary">&larr; Prev</button>
+      ${extra}
+      <button id="pr-next" class="secondary">Next &rarr;</button>
+    </div>`;
+}
 
+function wireNav() {
+  const n = practice.lines.length;
+  $('pr-prev').onclick = () => { practice.i = (practice.i - 1 + n) % n; renderPractice(); };
+  $('pr-next').onclick = () => { practice.i = (practice.i + 1) % n; renderPractice(); };
+}
+
+function renderLetters(item) {
   $('practice').innerHTML = `
     <div class="drill">
-      <div class="drill-tag">Meaning check — what is this line saying?</div>
-      <div class="gurmukhi big">${esc(g.line.gurmukhi)}</div>
-      ${g.line.teeka_pa ? `<div class="drill-teeka">${esc(g.line.teeka_pa)}</div>` : ''}
-      <div class="options">
-        ${g.options.map((o, i) => `<button class="option" data-i="${i}">${esc(o)}</button>`).join('')}
-      </div>
-      <p class="muted drill-note">Understand the rahao and the rest of the shabad unlocks.</p>
-    </div>`;
-
-  $('practice').querySelectorAll('.option').forEach((b, i) => {
-    b.onclick = async () => {
-      const right = g.options[i] === g.answer;
-      b.classList.add(right ? 'right' : 'wrong');
-      if (!right) {
-        $('practice').querySelectorAll('.option').forEach((x, j) => {
-          if (g.options[j] === g.answer) x.classList.add('right');
-        });
-      }
-      $('practice').querySelectorAll('.option').forEach((x) => { x.disabled = true; });
-      if (right) {
-        try { await api(`/api/learning/${shabadId}/gate`, { method: 'POST' }); } catch { /* retry next time */ }
-      }
-      practice.gated.add(shabadId);
-      setTimeout(renderPractice, right ? 650 : 2200);
-    };
-  });
-}
-
-function drillPrompt(item) {
-  switch (item.level) {
-    case 0: return '';
-    case 1: return '';
-    case 2: return `<div class="drill-en">${esc(item.translation_en || '')}</div>`;
-    case 3: return item.prev_gurmukhi
-      ? `<div class="drill-tag">the line before</div>
-         <div class="gurmukhi">${esc(item.prev_gurmukhi)}</div>`
-      : `<div class="drill-tag">this is the opening line</div>`;
-    default: return `<div class="drill-tag">line ${item.line_no} of
-                     &ldquo;${esc(item.source_line)}&rdquo;</div>`;
-  }
-}
-
-function renderDrill(item) {
-  const lvl = item.level;
-
-  // level 0 is exposure, not a test: read it with everything in front of you
-  if (lvl === 0) {
-    $('practice').innerHTML = `
-      <div class="drill">
-        <div class="drill-tag">Learn — line ${item.line_no}</div>
-        <div class="gurmukhi big">${esc(item.gurmukhi)}</div>
-        <div class="drill-en">${esc(item.translation_en || '')}</div>
-        ${item.teeka_pa ? `<div class="drill-teeka">${esc(item.teeka_pa)}</div>` : ''}
-        <div class="drill-actions"><button id="dr-next">Got it</button></div>
-      </div>`;
-    $('dr-next').onclick = () => grade(item, 2);
-    return;
-  }
-
-  if (lvl === 1) { renderMeaning(item); return; }
-
-  // levels 2-4: type the first letters, checked against first_letters
-  if (lvl <= 4) {
-    $('practice').innerHTML = `
-      <div class="drill">
-        <div class="drill-tag">${esc(LEVEL_NAMES[lvl])} — type the first letters</div>
-        ${drillPrompt(item)}
-        <input id="dr-input" type="text" autocomplete="off" autocapitalize="off"
-               spellcheck="false" placeholder="e.g. gkbvv">
-        <div class="drill-actions"><button id="dr-check">Check</button></div>
-        <div id="dr-result"></div>
-      </div>`;
-    const input = $('dr-input');
-    input.focus();
-    const check = () => {
-      const got = normLetters(input.value);
-      if (!got) return;
-      const want = normLetters(item.first_letters);
-      const right = got === want;
-      input.disabled = true;
-      $('dr-check').hidden = true;
-      $('dr-result').innerHTML = `
-        <div class="verdict ${right ? 'right' : 'wrong'}">
-          ${right ? 'Correct' : `Not quite — it was <code>${esc(item.first_letters)}</code>`}
-        </div>
-        <div class="gurmukhi big">${esc(item.gurmukhi)}</div>
-        <div class="drill-en">${esc(item.translation_en || '')}</div>
-        <div class="drill-actions">
-          ${right ? '<button id="g2">Next</button>'
-                  : `<button id="g1" class="secondary">I was close</button>
-                     <button id="g0">Blank</button>`}
-        </div>`;
-      if (right) $('g2').onclick = () => grade(item, 2);
-      else { $('g1').onclick = () => grade(item, 1); $('g0').onclick = () => grade(item, 0); }
-    };
-    $('dr-check').onclick = check;
-    input.onkeydown = (e) => { if (e.key === 'Enter') check(); };
-    return;
-  }
-
-  // level 5: recite it whole, then judge yourself -- no way to check this in text
-  $('practice').innerHTML = `
-    <div class="drill">
-      <div class="drill-tag">Full recall — recite it, then reveal</div>
-      ${drillPrompt(item)}
-      <div class="drill-en">${esc(item.translation_en || '')}</div>
-      <div class="drill-actions"><button id="dr-reveal">Reveal</button></div>
-      <div id="dr-result"></div>
-    </div>`;
-  $('dr-reveal').onclick = () => {
-    $('dr-reveal').hidden = true;
-    $('dr-result').innerHTML = `
-      <div class="gurmukhi big">${esc(item.gurmukhi)}</div>
+      <div class="drill-tag">Line ${item.line_no} &mdash; type the first letters</div>
+      ${item.translation_en ? `<div class="drill-en">${esc(item.translation_en)}</div>` : ''}
+      <input id="dr-input" type="text" autocomplete="off" autocapitalize="off"
+             spellcheck="false" placeholder="e.g. gkbvv">
       <div class="drill-actions">
-        <button id="g0" class="secondary">Blank</button>
-        <button id="g1" class="secondary">Nearly</button>
-        <button id="g2">Got it</button>
-      </div>`;
-    for (const g of [0, 1, 2]) $('g' + g).onclick = () => grade(item, g);
+        <button id="dr-check">Check</button>
+        <button id="dr-reveal" class="secondary">Reveal</button>
+      </div>
+      <div id="dr-result"></div>
+      ${practiceNav()}
+    </div>`;
+  wireNav();
+
+  const input = $('dr-input');
+  input.focus();
+
+  const reveal = (verdict) => {
+    $('dr-result').innerHTML = `
+      ${verdict}
+      <div class="gurmukhi big">${esc(item.gurmukhi)}</div>
+      <div class="mono letters">${esc(item.first_letters || '')}</div>
+      ${item.teeka_pa ? `<div class="drill-teeka">${esc(item.teeka_pa)}</div>` : ''}`;
   };
+
+  $('dr-check').onclick = () => {
+    const got = normLetters(input.value);
+    if (!got) return;
+    const right = got === normLetters(item.first_letters);
+    reveal(`<div class="verdict ${right ? 'right' : 'wrong'}">${
+      right ? 'Correct' : 'Not quite'}</div>`);
+  };
+  // No grading buttons. Whether you got it is between you and the line -- the
+  // app has no opinion and records nothing.
+  $('dr-reveal').onclick = () => reveal('');
+  input.onkeydown = (e) => { if (e.key === 'Enter') $('dr-check').onclick(); };
 }
 
 async function renderMeaning(item) {
+  $('practice').innerHTML = '<p class="muted">Loading…</p>';
   let q;
-  try { q = await api('/api/learning/quiz/' + item.line_id); }
-  catch (err) { toast(err.message, true); grade(item, 1); return; }
+  try { q = await api('/api/quiz/' + item.id); }
+  catch (err) { $('practice').innerHTML =
+    `<p class="muted">Could not load: ${esc(err.message)}</p>`; return; }
 
   $('practice').innerHTML = `
     <div class="drill">
-      <div class="drill-tag">Meaning — line ${item.line_no}</div>
-      <div class="gurmukhi big">${esc(item.gurmukhi)}</div>
+      <div class="drill-tag">Line ${item.line_no} &mdash; what does it mean?</div>
+      <div class="gurmukhi big">${esc(q.gurmukhi)}</div>
       <div class="options">
-        ${q.options.map((o, i) => `<button class="option" data-i="${i}">${esc(o)}</button>`).join('')}
+        ${q.options.map((o, i) =>
+          `<button class="option" data-i="${i}">${esc(o)}</button>`).join('')}
       </div>
+      ${practiceNav()}
     </div>`;
+  wireNav();
 
   $('practice').querySelectorAll('.option').forEach((b, i) => {
     b.onclick = () => {
@@ -1250,21 +1252,46 @@ async function renderMeaning(item) {
         x.disabled = true;
         if (!right && q.options[j] === q.answer) x.classList.add('right');
       });
-      setTimeout(() => grade(item, right ? 2 : 0), right ? 600 : 1800);
     };
   });
 }
 
-async function grade(item, g) {
-  try {
-    await api('/api/learning/review', json('POST', { line_id: item.line_id, grade: g }));
-    practice.answered += 1;
-  } catch (err) { toast(err.message, true); }
-  practice.i += 1;
-  renderPractice();
+// CLAUDE.md §3: the whole shabad, first letters only, no interruptions. This is
+// the one that maps onto actually singing it -- the others are for learning a
+// line, this is for holding the shape of the whole thing.
+function renderPerform() {
+  $('practice-progress').textContent = `${practice.lines.length} lines`;
+  $('practice').innerHTML = `
+    <div class="perform">
+      <div class="drill-tag">Tap any line to reveal it</div>
+      ${practice.lines.map((l, i) => `
+        <div class="perform-line" data-i="${i}">
+          <span class="mono letters">${esc(l.first_letters || '—')}</span>
+          <div class="gurmukhi reveal" hidden>${esc(l.gurmukhi)}</div>
+        </div>`).join('')}
+      <div class="drill-actions">
+        <button id="pf-all" class="secondary">Reveal all</button>
+        <button id="pf-none" class="secondary">Hide all</button>
+      </div>
+    </div>`;
+
+  $('practice').onclick = (e) => {
+    const row = e.target.closest('.perform-line');
+    if (row) {
+      const g = row.querySelector('.reveal');
+      g.hidden = !g.hidden;
+    }
+  };
+  const setAll = (hidden) => $('practice').querySelectorAll('.reveal')
+    .forEach((g) => { g.hidden = hidden; });
+  $('pf-all').onclick = () => setAll(false);
+  $('pf-none').onclick = () => setAll(true);
 }
 
-let LEVEL_NAMES = ['Learn', 'Meaning', 'First letters', 'Chained', 'From memory', 'Full recall'];
+$('view-practice').querySelectorAll('.mode-btn').forEach((b) => {
+  b.onclick = () => setMode(b.dataset.mode);
+});
+$('practice-quit').onclick = () => { go('learn'); refreshLearnBadge(); };
 
 // ---------- history ----------
 
@@ -1503,8 +1530,6 @@ $('nav-deck').onclick = () => {
 $('nav-saved').onclick = () => go('saved');
 $('nav-history').onclick = () => go('history');
 $('nav-learn').onclick = () => go('learn');
-$('learn-start').onclick = startPractice;
-$('practice-quit').onclick = endPractice;
 
 $('d-learn').onclick = async () => {
   const on = $('d-learn').classList.contains('on');
@@ -1624,9 +1649,9 @@ $('s-source').onchange = runSearch;
                    'd-heart', 'd-sttm', 'd-edit', 'edit-dialog', 'edit-body',
                    'e-save', 'e-delete', 'e-cancel', 'e-close', 'f-clear',
                    'nav-history', 'history-list', 'history-clear', 'history-head',
-                   'nav-learn', 'learn-due', 'learn-list', 'learn-start', 'learn-title',
+                   'nav-learn', 'learn-due', 'learn-list', 'learn-title',
                    'learn-sub', 'd-learn', 'practice', 'practice-quit',
-                   'practice-progress', 'practice-timer',
+                   'practice-progress',
                    'nav-settings', 'set-models', 'set-scores', 'set-auto-index',
                    'similar', 'sim-back', 'sim-blind', 'sim-open',
                    'index-dialog', 'index-body', 'ix-close', 'ix-done',

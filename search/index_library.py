@@ -51,6 +51,27 @@ CHUNK = 25
 EMBED_BATCH = 16
 LOCK_PATH = os.path.join(HERE, ".index.lock")
 
+# A cooperative stop, written by the app when a model is switched off mid-run.
+#
+# Deliberately NOT "kill the pid in the lock file". take_lock already explains
+# why pids are not trusted here -- they get recycled, and on Windows there is no
+# cheap portable way to ask whether one is still alive -- so killing by pid risks
+# killing something else entirely. A flag the indexer looks at has none of that
+# risk, drops its own lock on the way out, marks its own job row, and finishes
+# the chunk it already paid for rather than throwing it away.
+STOP_PATH = os.path.join(HERE, ".index.stop")
+
+
+def stop_requested():
+    return os.path.exists(STOP_PATH)
+
+
+def clear_stop():
+    try:
+        os.unlink(STOP_PATH)
+    except OSError:
+        pass
+
 
 class AlreadyRunning(Exception):
     pass
@@ -296,7 +317,8 @@ def summarise(conn, key, name, reg, ver, use_batch, limit):
                 key, model_id, [g["row"] for g in chunk],
                 workers=reg[name].get("workers", 6),
                 extra=reg[name].get("options"),
-                max_tpl=reg[name].get("max_tokens_per_line"))
+                max_tpl=reg[name].get("max_tokens_per_line"),
+                should_stop=stop_requested)
             got = [(g, out[g["row"]["gurmukhi"]]) for g in chunk
                    if g["row"]["gurmukhi"] in out]
             written += save_chunk(conn, name, ver, got)
@@ -305,6 +327,19 @@ def summarise(conn, key, name, reg, ver, use_batch, limit):
             done += len(chunk)
             job.tick(done=min(done, len(groups)), spent=spent)
             progress(name, done, len(groups), started, spent)
+            # Save first, THEN check. Whatever came back is already paid for, so
+            # it is written before honouring the stop -- a stop must cost nothing
+            # beyond the calls already in flight.
+            if stop_requested():
+                job.finish("stopped", "stopped from the app")
+                say(f"\n  stopped from the app. {written} lines saved "
+                    "-- switch the model back on to carry on.")
+                # Embedding still runs after this returns, and that is deliberate:
+                # it is local, free, and takes seconds, while skipping it would
+                # leave summaries that were paid for but cannot be searched --
+                # the one state the control panel calls out as a fault. Stopping
+                # is about not spending more, not about abandoning what is bought.
+                return
     except KeyboardInterrupt:
         job.finish("stopped", "interrupted")
         say(f"\n  stopped. {written} lines saved -- run again to carry on.")
@@ -461,6 +496,14 @@ def main():
             return
         import atexit
         atexit.register(drop_lock)
+        # Clear the flag on the way out too, whichever way we leave. A flag that
+        # outlives the run it stopped would silently halt the NEXT run before it
+        # asked for a single line.
+        atexit.register(clear_stop)
+        # And clear one left by a run that died before its atexit could fire.
+        # Only after the lock is held, so this cannot wipe a stop aimed at a
+        # different process that is still shutting down.
+        clear_stop()
 
     conn = db(write=True)
     sweep_dead_jobs(conn)          # tidy up after any run that was killed

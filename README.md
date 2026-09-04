@@ -6,12 +6,91 @@ Everything you need day to day. `CLAUDE.md` holds the design and reasoning; this
 
 ## Every day
 
+**Double-click `restart.bat`.** That is the whole thing — it stops whatever is
+running, starts the app, opens a tunnel, checks the link actually works, copies
+it to your clipboard and pushes it to your phone.
+
+Or, by hand:
+
 ```bash
 python -m uvicorn api:app --port 8000        # start the app -> http://localhost:8000
-python tools/backup.py                             # back up (do this after editing)
+python tools/backup.py                       # back up (do this after editing)
 ```
 
 Docker is **not** needed to run the app. Ctrl+C stops the server.
+
+---
+
+## Running it over the internet
+
+### One-time setup
+
+Put these in `.env` (copy `.env.example`):
+
+```
+APP_USER=keertan
+APP_PASSWORD=<something only you know>
+NTFY_TOPIC=gurbanify-<random>
+```
+
+Then install **ntfy** on your phone (free, no account) and subscribe to that
+exact topic. That is where the link gets sent.
+
+**The topic name is the only secret.** Anyone who knows it can read your
+notifications, which contain the address of your library. Never a guessable one.
+
+### Starting it
+
+```
+restart.bat                                    everything, with a public link
+powershell -File tools\serve.ps1 -NoTunnel     local only, no link
+```
+
+What it does, in order: kills anything on port 8000 and any stray `cloudflared`
+→ starts the app → waits for `/health` to actually answer → starts the tunnel →
+**fetches the link to check it routes** → retries with a fresh one if it doesn't
+→ copies it to the clipboard and pushes it to your phone.
+
+That fetch-and-retry is the point. A Quick Tunnel regularly hands back a
+hostname that is not yet routable, and the only way to know is to try it.
+
+### Keeping it up forever
+
+```powershell
+powershell -File tools\register-task.ps1       # as Administrator, once
+Start-ScheduledTask -TaskName GurbanifyWatchdog
+Get-Content logs\watchdog.log -Wait -Tail 20   # watch it
+```
+
+The watchdog checks `/health` every 30 seconds, restarts whatever died, and
+**notifies you only when the URL changes** — a flapping tunnel would otherwise
+wake you hourly. It also re-sends the current link every 8 hours, which keeps a
+live copy inside ntfy's ~12-hour retention window even if your phone was off.
+
+Registered `AtStartup` and as `SYSTEM`, so a power cut or a Windows Update
+reboot brings everything back with nobody logged in.
+
+Remove it with `powershell -File tools\register-task.ps1 -Remove`.
+
+### The password
+
+Every request needs it except `/health`. Your browser asks once and remembers.
+
+**There is no exemption for localhost, deliberately.** `cloudflared` runs on
+this machine and proxies to `http://localhost:8000`, so every request off the
+public internet arrives looking local — an exemption for local addresses would
+exempt the entire internet.
+
+`serve.ps1` refuses to open a tunnel when `APP_PASSWORD` is empty. A Quick
+Tunnel URL is public, and without a password anyone who finds it can edit and
+delete your library.
+
+### Why not a fixed address
+
+Quick Tunnel URLs change whenever `cloudflared` restarts, which is what all of
+the above exists to work around. A **named tunnel** gives a permanent hostname
+and makes the watchdog unnecessary — but it needs a domain (~$10/yr) on
+Cloudflare. Worth it the day the random links become annoying.
 
 ---
 
@@ -164,9 +243,34 @@ still recorded on every swipe, so turning it back on later needs no new data.
 
 ---
 
+## Memorizing
+
+**Learn** tab. Open a shabad → **Learn** to add it to the list.
+
+Tap any shabad in the list to practise it. Three modes, switch freely:
+
+| mode | what it does |
+|---|---|
+| **First letters** | shows the English, you type `gkbvv`, checked against the real first letters |
+| **Meaning** | shows the Gurmukhi, pick the right English from four |
+| **Perform** | the whole shabad as first letters only — tap any line to reveal it |
+
+- **Prev / Next in every mode**, and they wrap, so you can go round as many times as you like
+- **Nothing is scheduled, graded or recorded.** No due dates, no levels, no streaks
+- Meaning distractors come from the most *similar* lines, so they're near-misses rather than obviously wrong
+- The list shows when you last practised each one — information, not a deadline
+
+There was a full spaced-repetition system here (SM-2, six levels, meaning gates,
+daily caps). It worked and went completely unused, so it was removed. If you
+ever want scheduling back, it's in git history at `bf27a11`.
+
+---
+
 ## Search quality: picking the summariser model
 
-The §6/§7 work. Not finished — no summaries or vectors are in the database yet.
+The §6/§7 work. **Done** — `gemini37` and `glm47nt` are both fully indexed
+(5,530 lines each), and the Similar page runs the blind comparison between them.
+This section is what you'd use to evaluate a *replacement* model.
 
 **One-time setup**
 
@@ -254,10 +358,10 @@ lines embedded from their plain English translation, no model involved.
 ```bash
 python search/embed.py --stats                 # how much of the library is indexed
 python search/embed.py --field summary         # write vectors into shabads.db
-python search/similar.py --line 305            # find similar lines (needs an index)
-python search/similar.py --text "fear of death"
 python search/test_clustering.py               # the original standalone §15 check
 ```
+
+(`search/similar.py` is gone — the Similar page in the app replaced it.)
 
 BGE-M3 loads only while a script runs (~3 GB RAM, ~30s) and **never in the web
 app** — the app only ever reads vectors already in the database.
@@ -292,7 +396,7 @@ Progress looks like this:
 **Two phases.** Summarising calls OpenRouter and costs money; embedding runs
 BGE-M3 locally and is free. `--summarise-only` and `--embed-only` split them.
 
-**Duplicate tuks are summarised once.** 303 of the 5,290 lines appear in more
+**Duplicate tuks are summarised once.** 306 of the 5,530 lines appear in more
 than one shabad; the same line means the same thing wherever it sits, so the
 summary is written to every line that shares it. About 6% off the bill.
 
@@ -309,10 +413,35 @@ editing that prompt costs a full re-run, so settle it on the bench first.
 
 ## When something breaks
 
+**Anything wrong with the server or the tunnel — double-click `restart.bat`.**
+It handles the port, the stale processes, the tunnel and the link. The commands
+below are what it does, for when you want to do it by hand.
+
 **"address already in use" / server won't start** — a previous server is still holding the port:
 
 ```powershell
 Get-NetTCPConnection -LocalPort 8000 -State Listen | Select -Expand OwningProcess -Unique | ForEach { Stop-Process -Id $_ -Force }
+```
+
+**The link in my phone stopped working** — the tunnel restarted and got a new
+hostname. If the watchdog is running it has already pushed the new one; check
+ntfy. Otherwise run `restart.bat`.
+
+**No notification arrived** — check `NTFY_TOPIC` in `.env` matches the topic you
+subscribed to, exactly. Test it with:
+
+```powershell
+Invoke-RestMethod -Uri "https://ntfy.sh/<your-topic>" -Method Post -Body "test"
+```
+
+**It asks for a password and I don't know it** — it's `APP_PASSWORD` in `.env`.
+Change it there and restart; browsers will re-prompt.
+
+**Is the watchdog actually running?**
+
+```powershell
+Get-ScheduledTask -TaskName GurbanifyWatchdog
+Get-Content logs\watchdog.log -Tail 20
 ```
 
 Don't use `uvicorn --reload` — its workers outlive the parent and keep serving stale code.
@@ -365,10 +494,20 @@ the databases by sitting beside them. Grouped by job:
 | `search/topics/*.txt` | your hand-grouped topics. **Your judgement, not regenerable** |
 | `search/cache/` | summaries already paid for, plus vectors. Rebuilding costs money |
 | `search/summarize.py` | LLM → an English summary per line, via OpenRouter |
+| `search/index_library.py` | **the full-library indexing pass** — resumable, per model |
 | `search/embed.py` | BGE-M3 → vectors in the database |
-| `search/similar.py` | the find-similar feature, on the command line |
 | `search/test_clustering.py` | standalone §15 check; bench reuses its scoring |
-| `.env` | your OpenRouter key. **Never commit this** |
+| `.env` | OpenRouter key, app password, ntfy topic. **Never commit this** |
+
+**Serving it** — app + tunnel + staying alive
+| file | |
+|---|---|
+| `restart.bat` | double-click: stop everything, start fresh, get a working link |
+| `tools/serve.ps1` | the actual logic behind it |
+| `tools/watchdog.ps1` | runs forever, restarts what dies, pushes the new link |
+| `tools/register-task.ps1` | installs the watchdog to run at boot |
+| `tools/loadtest.js` | do the frontend scripts load? catches what `node --check` can't |
+| `logs/` | server, tunnel and watchdog logs, plus the current url. Gitignored |
 
 **Docs**
 | file | |

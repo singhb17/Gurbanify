@@ -132,19 +132,25 @@
       <h2 id="learn-title">Memorizing</h2>
       <span class="muted" id="learn-sub"></span>
     </div>
-    <button id="learn-start">Start practice</button>
   </div>
+  <div id="learn-filters" class="chips learn-filters"></div>
   <div id="learn-list"></div>
 </section>
 
 <!-- ============ PRACTICE ============ -->
+<!-- Self-directed, always. Pick a shabad, pick a mode, move at your own pace.
+     Nothing is scheduled, nothing is graded, nothing is withheld until you have
+     earned it. There was a full SM-2 system here and it went unused, because
+     being told what to practise turns a thing you want to do into a chore. -->
 <section id="view-practice" hidden>
   <div class="practice-bar">
     <button id="practice-quit" class="secondary">&larr; Done</button>
-    <div class="practice-meta">
-      <span id="practice-progress" class="muted"></span>
-      <span id="practice-timer" class="muted"></span>
+    <div class="practice-modes">
+      <button class="mode-btn on" data-mode="letters">First letters</button>
+      <button class="mode-btn" data-mode="meaning">Meaning</button>
+      <button class="mode-btn" data-mode="perform">Perform</button>
     </div>
+    <span id="practice-progress" class="muted"></span>
   </div>
   <div id="practice"></div>
 </section>
@@ -200,7 +206,27 @@
       <button id="sim-open" class="secondary">Open shabad</button>
     </div>
   </div>
+
+  <!-- Filters here do NOT persist: you arrive from one specific line for one
+       specific reason, and a narrowing left on from last time would read as a
+       broken search rather than a filter. Reset on every arrival. -->
+  <div class="filters sim-filters">
+    <div class="toolbar">
+      <details class="filter-panel" id="sim-filter-wrap">
+        <summary>Filters<span id="sim-filter-count" class="fcount"></span></summary>
+        <div class="filter-pop">
+          <div id="sim-filter-groups"></div>
+          <button id="sim-filter-clear" class="secondary">Clear all filters</button>
+        </div>
+      </details>
+      <span id="sim-count" class="muted"></span>
+    </div>
+  </div>
+
   <div id="similar"></div>
+  <div class="sim-more">
+    <button id="sim-more" class="secondary" hidden>Show more</button>
+  </div>
 </section>
 
 <!-- ============ SETTINGS ============ -->
@@ -222,6 +248,21 @@
   </div>
 
   <div class="panel">
+    <h3>Screen</h3>
+    <label class="set-row">
+      <input type="checkbox" id="set-wake-lock">
+      <div>
+        <b>Keep the screen awake</b>
+        <div class="muted">Stops the phone locking itself while the app is open,
+          so a shabad stays on screen through a whole keertan without being
+          tapped. Only applies while the app is in front &mdash; switch away and
+          the phone goes back to normal. Needs an <b>https</b> address, which the
+          Cloudflare tunnel provides.</div>
+      </div>
+    </label>
+  </div>
+
+  <div class="panel">
     <h3>Summariser models</h3>
     <p class="muted">Switching one off stops it contributing results. Nothing is
       deleted &mdash; its summaries and every vote you have cast survive, so
@@ -237,7 +278,101 @@
       returned separates nobody.</p>
     <div id="set-scores"></div>
   </div>
+
+  <div class="panel">
+    <h3>Control panel</h3>
+    <p class="muted">Balance, indexing coverage, interrupted runs, integrity
+      checks and the indexer's log. Everything that is normally invisible.</p>
+    <button id="set-status-link" class="secondary">Open control panel &rarr;</button>
+  </div>
 </section>
+
+<!-- ============ CONTROL PANEL ============ -->
+<!-- Diagnostics, deliberately not in the nav: it is somewhere you go when
+     something looks wrong, not somewhere you work. The gear grows a dot when
+     there is an alert, so it is findable without costing a seventh nav slot.
+
+     Read-only by design. Nothing on this page starts, stops or repairs
+     anything -- it says what is true and names the command that fixes it, so
+     opening it is always safe. -->
+<section id="view-status">
+  <div class="status-head">
+    <h2>Control panel</h2>
+    <div class="spacer"></div>
+    <span id="st-time" class="muted mono"></span>
+    <button id="st-refresh" class="secondary">Refresh</button>
+  </div>
+
+  <div id="st-alerts"></div>
+
+  <div class="panel">
+    <h3>OpenRouter account</h3>
+    <div id="st-account"></div>
+  </div>
+
+  <div class="panel">
+    <h3>Index coverage</h3>
+    <p class="muted">Summaries are bought and cost money; vectors are computed
+      locally and are free. A gap between them means the expensive half
+      succeeded and the free half was interrupted.</p>
+    <div id="st-models"></div>
+  </div>
+
+  <div class="panel">
+    <h3>Recent indexing runs</h3>
+    <div id="st-jobs"></div>
+  </div>
+
+  <div class="panel">
+    <h3>Library</h3>
+    <div id="st-library"></div>
+  </div>
+
+  <div class="panel">
+    <h3>Backups</h3>
+    <p class="muted">Writes three files: an exact <span class="mono">.db</span>
+      snapshot, a Notion-ready <span class="mono">.csv</span>, and a
+      <span class="mono">.csv</span> of memorisation progress. The csvs matter
+      more than the snapshot &mdash; plain text outlives any program that could
+      read the binary.</p>
+    <div id="st-backups"></div>
+    <div class="st-actions">
+      <button id="st-backup-run">Back up now</button>
+      <span id="st-backup-note" class="muted"></span>
+    </div>
+    <pre id="st-backup-out" class="log" hidden></pre>
+  </div>
+
+  <div class="panel">
+    <h3>System</h3>
+    <div id="st-system"></div>
+  </div>
+
+  <div class="panel">
+    <h3>Indexer log</h3>
+    <p class="muted">The tail of <span class="mono">search/index.log</span>.
+      Background runs are detached, so this is the only place their failures
+      are recorded.</p>
+    <pre id="st-log" class="log"></pre>
+  </div>
+</section>
+
+<!-- ============ ENABLE-MODEL DIALOG ============ -->
+<!-- Switching a model on is the only action in the app that spends money, and
+     how much depends on how much of the library that model has already done.
+     So it is priced on screen before the switch moves, never after. -->
+<dialog id="enable-dialog">
+  <div class="dialog-head">
+    <h2>Switch this model on?</h2>
+    <button id="en-close" class="secondary" aria-label="Close">&times;</button>
+  </div>
+  <div id="enable-body"></div>
+  <div class="dialog-foot">
+    <span class="spacer"></span>
+    <button id="en-cancel" class="secondary">Cancel</button>
+    <button id="en-go">Switch on &amp; index</button>
+  </div>
+</dialog>
 
 <!-- ============ INDEXING DIALOG ============ -->
 <dialog id="index-dialog">
@@ -259,5 +394,7 @@
      growing a 1,500-line file further. No build step, so plain tags in order. -->
 <script src="/static/similar.js"></script>
 <script src="/static/settings.js"></script>
+<script src="/static/status.js"></script>
+<script src="/static/wake.js"></script>
 </body>
 </html>

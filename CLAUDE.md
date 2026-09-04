@@ -44,6 +44,18 @@ This replaces a Notion database table.
 - Filter and sort by any tag
 - List view that is actually usable on a phone
 
+**Filters — BUILT, and shared by all three panels** (library, deck, similar):
+- **Two tiers.** Basic: status, rarity, genre, speed, length. Advanced, behind a disclosure: raag, writer. Both are real filters, but raag is almost never the question and in the open it turns the panel into a wall you scroll past.
+- **A hidden active filter is the bug to avoid**, so the collapsed summary counts advanced selections and the disclosure opens itself when any is set. A raag left on from last week, silently narrowing results with nothing on screen to explain it, looks exactly like correct behaviour.
+- **Length is bands, not a slider** — Short 1–8 / Medium 9–16 / Long 17+, from the real distribution (median 11, p90 25). Multi-select is what makes one control cover every case: short+medium is a maximum of 16, medium+long is a minimum of 9. A "minimum lines" filter therefore needs nothing built.
+- Bands are **defined server-side and served through `/api/filters`** with live counts, so the UI never hardcodes where "Short" ends.
+- Everything routes through `filter_clauses()`, so a filter cannot mean one thing in the library and another in the deck or on the similar page.
+
+**Similar page: filter first, then take the top 20.** The whole library is scored either way (~0.7 ms of numpy), so masking before the slice always returns a full page. Filtering the visible 20 afterwards would leave however few happened to match, and "show more" would exist to paper over that.
+- **Paging belongs to the merged list, never to one model.** With an offset per model, a line model A puts on page 2 may be one model B already showed on page 1 — measured, and it repeated rows. Take each model's top (offset+limit+1) and page the merge.
+- `model_results` records the **true unfiltered rank** of only what was actually shown. A rank that moved because a filter was on would make the model comparison depend on how the UI happened to be configured.
+- Filters here **do not persist** — you arrive from one line for one reason, and a stale narrowing reads as a broken search.
+
 **Swipe deck — BUILT:**
 - Tinder-style card stack for rediscovering shabads I haven't done in a while
 - Swipe left = dismiss, swipe right = adds to the `Interested` shortlist
@@ -58,24 +70,25 @@ As implemented:
 - Both directions stamp it — "I've seen this recently" is equally true of one I passed on.
 - Shortlisted shabads are excluded from the deck. Swiping right twice is not an error.
 
-**Memorization — PLANNED, not built:**
+**Memorization — BUILT, then deliberately gutted (2026-09-04).**
 
 The goal is recall during keertan, not ratta. Somewhere between word-perfect and "the tune carries me" — the tune helps, but must not be load-bearing.
 
-- **Learning list**, a third list alongside Interested. Not exclusive — wanting to sing a shabad and wanting to memorise it are different things.
-- **All lines included**, headers too. Line 1 is usually the raag/mahalla header, but not always — some shabads open on a real tuk, and a heuristic would misfire exactly where it matters. One extra line costs nothing.
-- **Rahao-first meaning gate.** Only the rahao must pass a meaning check; passing it unlocks the whole shabad for drilling. Other lines get meaning checks folded into normal review rather than gating. 40 quizzes before singing a word is a wall nobody climbs.
-- **Meaning checks are auto-generated** — multiple choice, distractors pulled from the other 4,704 lines in the library. No LLM. Once §7's vectors exist, pull distractors from the *most similar* lines: near-misses force real discrimination.
-- **Scaffold, degrading the cue:** read → meaning check → recite along → first letters → first letter only → chained (given line N, produce N+1) → cold (given the English, produce the Gurmukhi).
-- **Typed first letters, objectively graded.** Type `gkbvv`, checked against `first_letters` — present on 100% of lines. This is the muscle memory keertanis already have from STTM search, and it removes self-assessment from the levels where it matters most. Full-recall levels stay self-graded; typing Gurmukhi would be miserable.
-- **Grading is three-way:** Blank / Nearly / Got it. Binary grading forces a choice between accepting sloppiness and restarting constantly.
-- **Hybrid SM-2:** ease and level tracked *per line*, scheduling done *per shabad*. When any line comes due the whole shabad surfaces and is run top to bottom, with weak lines drilled harder inside the session. Pure per-line scheduling fragments a shabad across days, which is useless for keertan where the flow is the thing.
-- **Interval capped at ~60 days. Nothing ever graduates.** Vanilla SM-2 grows intervals without limit, which is exactly how a shabad memorised once gets lost. Maintenance is a permanent stage, not an exit. Costs little: steady-state daily reviews ≈ total lines ÷ cap, so 50 shabads is ~11 lines a day.
-- **Daily short bursts.** A session budget, not a due-list dump; over budget, priority is most-overdue → weakest → new. Cap new material per day — adding five shabads in a burst of enthusiasm and drowning three weeks later is the classic failure.
-- **Perform mode:** whole shabad, first letters only, no interruptions.
-- Per-shabad stage is *derived* from its lines, never set by hand — same principle as `last_surfaced`.
-- No line selector in v1. Scope lives in *which lines have progress rows*, so adding a selector later needs no migration. Only 7 shabads have multiple ਰਹਾਉ markers; 93 are 16+ lines, so a selector would mostly serve trimming length, not unbundling.
-- **Progress is irreplaceable** (§5 "mine") — months of daily work, regenerable by nothing. It goes in both backup forms, and the learning csv is keyed on `banidb_verse_id` so it survives a full library rebuild.
+**A full SM-2 system was built and went unused.** Per-line ease factors, six scaffold levels, a rahao-first meaning gate, daily new-material caps, interval scheduling capped at 60 days, three-way grading, a `learning_lines` table. All of it worked. None of it was touched after the week it was written.
+
+**The scheduling was why.** Being told what to practise and when turns something you want to do into something you are behind on — and the honest response to a feature you avoid is to delete it, not to tune it. 340 lines of `api.py` and 306 of `app.js` came out.
+
+What replaced it, and the rule it follows — **give control, never impose structure**:
+
+- **A list.** Add a shabad, remove it, that is the whole model. `last_practised` is recorded but is *information*, never a schedule — nothing reads it to decide what you should do next.
+- **Three modes, always available, never unlocked:** first letters (type them, checked against `first_letters`), meaning (multiple choice English), and perform (the whole shabad as first letters, tap any line to reveal).
+- **Prev/Next in every mode, wrapping both ways.** There is no correct direction through a shabad you are revising.
+- **Nothing is graded and nothing is recorded.** Whether you got a line is between you and the line.
+- **All lines included**, headers too. Line 1 is usually the raag/mahalla header, but not always — some shabads open on a real tuk, and a heuristic would misfire exactly where it matters. One extra line costs nothing to page past.
+- **Meaning distractors come from the most similar lines** (§7's vectors), not random ones — near-misses force real discrimination where four random lines can be dismissed on subject alone. Falls back to random when a line has no vectors yet.
+- **Perform mode is the one that maps onto actually singing it.** The others teach a line; this holds the shape of the whole.
+
+There is now no irreplaceable progress here — the list itself is the only "mine" data, and it still goes in both backup forms, keyed on `banidb_shabad_id` so it survives a library rebuild.
 
 **Similarity search (build last):**
 - Tap a line → return other lines in my library with similar meaning
@@ -95,7 +108,26 @@ Several models get indexed rather than one, and the search screen doubles as the
 - **Thumbs up and thumbs down per result card, not tapping.** Opening a shabad to check its tags is not an endorsement. Down-votes are load-bearing in their own right: they catch embeddings over-collapsing distinctions (§7 — anhad naad is not naam japna), which an absent up-vote cannot distinguish from not having got round to it.
 - **Only uniquely-contributed results discriminate.** A line both models returned says nothing about either. Scores are reported twice: over everything, and over uniques alone.
 - **Models can be switched off in settings**, not deleted. A model that keeps losing stops contributing to the merged pool but keeps its stored summaries and every past vote, so re-enabling is free.
+- **A disabled model is never sent to the API.** Indexing — automatic or manual — targets only what is switched on, so switching off is also how you stop spending on one. Re-enabling is therefore the one action in the app that can cost real money, and it is **gated behind a priced confirmation**: lines outstanding, estimated cost, credit remaining. Agreeing starts a catch-up run capped at the figure shown, so the amount agreed to is the amount enforced.
+- **Switching off is also the stop button.** There is no separate one. "Stop spending on this" is what the switch already means, so a run left going after it moved would make the switch a lie. It is a **cooperative stop** — a flag file the indexer checks after each line and each saved chunk — not a kill by pid: pids are recycled, and a flag also lets the run stop at a point of its own choosing, keeping the chunk already paid for. Embedding still finishes afterwards, because it is local, free, and skipping it would strand paid-for summaries in the one state the control panel calls a fault. The reverse does not hold: switching **on** never starts a run by itself, because that spends money.
+- **Prices move mid-project, and the design has to absorb that.** DeepSeek v4 Pro roughly doubled overnight ($3.75 → $6.67 for a full index) — all twelve of its providers moved together, so an upstream rise, not a routing accident. `glm47nt` replaced it on 2026-08-19 at $3.41, having benched one point apart, which is noise across 108 lines. **The swap was an `UPDATE` and a regenerate.** No schema changed, and every vote survived, because `line_relations` records the judgement and not the model — which is the whole reason §5 keeps them in separate tables. Where a model has several providers at different prices, pin the cheapest in `models.json` with `allow_fallbacks` on.
 - **A scores page** shows per-model up/down ratio, unique-contribution ratio, and coverage.
+
+**Screen wake lock — BUILT.** The phone must not lock itself mid-keertan with a shabad on screen.
+- **The native Screen Wake Lock API, not NoSleep.js.** That library predates the API and works by playing a hidden looping video — battery cost, and it can grab the audio session, which is wrong in an app used while a recording may be playing.
+- **Requires https.** The API does not exist in an insecure context, so a plain `http://<lan-ip>:8000` cannot do it. Through the Cloudflare tunnel the browser sees https and it works; the http hop from `cloudflared` to this server is invisible to the browser.
+- **The lock is auto-released every time the page stops being visible, and does NOT come back.** Re-acquiring on `visibilitychange` is the whole feature — without it it works once per launch and then silently stops, which reads as broken rather than expired. It also needs a user gesture, so the first attempt is retried on the first tap.
+- Always on while the app is in front, one Settings switch, no per-screen rules. Routing is `pushState`, so the lock survives every navigation; only a hard reload drops it.
+- The control panel reports **active / off / blocked / unsupported**, read from the browser rather than the server — whether this device's screen is being held is a fact the server cannot see, and "needs https" is a very different problem from "the browser refused".
+
+**Control panel — BUILT.** `/status`, reached from Settings, not the nav.
+
+**Diagnosis-only, with exactly one exception: Back up now.** Everything else reports a problem and names the command that fixes it rather than running it, so opening the page is safe precisely when something is already broken and the temptation is to press whatever is nearest. Backup earns the exception on a test the others fail — it only ever *adds* files, running it twice is harmless, and it is literally what the "no backups" alert instructs. The bar for a second button is that same test, not "it would be convenient". It runs `tools/backup.py` synchronously and returns that script's stdout verbatim, so there is one description of what happened rather than two that can drift.
+
+- **Alerts are derived server-side**, because they are judgements ("a run that stopped is a problem; one you stopped is not") and belong beside the data they judge. The page only renders a sorted list, which is what keeps it simple as checks accumulate.
+- Covers: balance, failed/stalled runs, **summarised-but-not-embedded** (the paid half worked, the free half didn't — fixed by `--embed-only` at no cost), malformed vectors, `prompt_ver` staleness, stale lock, missing backups, shabads with no lines.
+- **The gear grows a red dot** when something needs attention. Checked once at startup, not polled — these conditions move slowly.
+- One endpoint, not six: a diagnostics page assembled from separate requests can contradict itself about the same job.
 
 **The votes outlive the decision, and that is the real prize.** A verdict of "these two lines are genuinely related" is a judgement about Gurbani, not about a model — §5 "mine", irreplaceable, and it stays true when every summary in the database is regenerated. Months of thumbing builds a labelled ground-truth set on the real library, which then evaluates any future model for free and at a scale the 108-line bench in `search/topics/` cannot approach. This is why the verdict is stored separately from which model surfaced it; merged into one table, regenerating summaries would throw the judgements away with the model output.
 
@@ -287,7 +319,7 @@ Result: the app keeps working even if home internet drops mid-program.
 2. List view, filters, CRUD. **Live on this for a while before building anything else.**
 3. ~~Swipe deck with recency weighting.~~ **Done** (weighting later removed on request; `last_surfaced` still recorded).
 4. Interested shortlist, open history, STTM deep links, edit dialog. **Done.**
-5. Memorization v1 — see §3. Planned in full, not started.
+5. ~~Memorization v1 — SM-2, scaffold levels, scheduling.~~ **Built, unused, removed.** Replaced by a plain list plus on-demand self-tests — see §3.
 6. Summaries and vectors, once the app is in daily use and I know what I actually want from search. **Do §15 first.**
 
 The failure mode for this project is building the interesting AI part first, getting it 80% right, and never doing the tedious import that makes it real. Import first.

@@ -596,8 +596,25 @@ body.deck-view { padding-bottom: 0; overflow: hidden; }
 }
 .learn-head h2 { margin: 0 0 .15rem; }
 
-.learn-card.due { border-color: var(--accent); }
-.due-flag { color: var(--accent); }
+/* Red / amber / green, set by hand. A stripe down the edge rather than a badge
+   in the corner, so the state of the whole list reads in one glance. */
+.learn-filters { margin-bottom: .8rem; }
+.learn-chip.red.on    { border-color: var(--danger);    color: var(--danger); }
+.learn-chip.amber.on  { border-color: var(--orange-fg); color: var(--orange-fg); }
+.learn-chip.green.on  { border-color: var(--green-fg);  color: var(--green-fg); }
+
+.learn-card { border-left: 3px solid var(--border); }
+.learn-card.st-red   { border-left-color: var(--danger); }
+.learn-card.st-amber { border-left-color: var(--orange-fg); }
+.learn-card.st-green { border-left-color: var(--green-fg); }
+
+.learn-status {
+  font-size: .78rem; padding: .2rem .4rem; margin-bottom: .35rem;
+  background: var(--surface-2); border: 1px solid var(--border);
+}
+.learn-status.red   { color: var(--danger); }
+.learn-status.amber { color: var(--orange-fg); }
+.learn-status.green { color: var(--green-fg); }
 
 /* how far through the scaffold this shabad's lines are, on average */
 .bar {
@@ -650,14 +667,207 @@ body.deck-view { padding-bottom: 0; overflow: hidden; }
 
 /* ---------- indexing dialog ---------- */
 
-#index-dialog {
+#index-dialog, #enable-dialog {
   width: min(30rem, calc(100vw - 2rem)); padding: 0;
   border: 1px solid var(--border-hi); border-radius: 12px;
   background: var(--surface); color: var(--text);
   box-shadow: 0 18px 50px rgba(0,0,0,.6);
 }
-#index-dialog::backdrop { background: rgba(0,0,0,.62); backdrop-filter: blur(2px); }
-#index-body { padding: 1rem; }
+#index-dialog::backdrop, #enable-dialog::backdrop {
+  background: rgba(0,0,0,.62); backdrop-filter: blur(2px);
+}
+#index-body, #enable-body { padding: 1rem; }
+
+/* ---------- enable-model dialog ---------- */
+
+.en-head { display: flex; align-items: baseline; gap: .5rem; margin-bottom: .9rem; }
+.en-head b { font-size: 1.05rem; }
+.en-head .mono { font-size: .78rem; }
+
+/* Coverage, not progress: how much of the library this model has already done.
+   At 0% it is an empty trough, which reads as "all of this is ahead of you"
+   faster than the sentence version did. */
+.en-bar {
+  height: 6px; border-radius: 3px; overflow: hidden;
+  background: var(--surface-2); border: 1px solid var(--border);
+}
+.en-bar span { display: block; height: 100%; background: var(--green-fg); }
+.en-bar-label {
+  display: flex; justify-content: space-between;
+  margin-top: .35rem; font-size: .78rem; color: var(--text-faint);
+}
+
+.en-stats { display: flex; gap: .5rem; margin: .9rem 0; }
+.en-stat {
+  flex: 1 1 0; min-width: 0; text-align: center;
+  padding: .6rem .3rem; border-radius: 8px;
+  background: var(--surface-2); border: 1px solid var(--border);
+}
+.en-stat b { display: block; font-size: 1.15rem; line-height: 1.3; }
+.en-stat span {
+  display: block; font-size: .72rem; color: var(--text-faint);
+  text-transform: uppercase; letter-spacing: .04em;
+}
+/* the one number that changes the decision */
+.en-stat.low { border-color: var(--orange-fg); }
+.en-stat.low b { color: var(--orange-fg); }
+
+/* Amber, not red: spending money you meant to spend is not an error. It is a
+   thing worth reading twice, which is what this weight is for. */
+#enable-body .warn {
+  margin: 0 0 .6rem; padding: .55rem .7rem; border-radius: 8px;
+  font-size: .87rem; line-height: 1.45;
+  background: var(--orange-bg); border-left: 3px solid var(--orange-fg);
+  color: var(--orange-fg);
+}
+.en-foot { margin: .2rem 0 0; font-size: .78rem; line-height: 1.5; }
+
+/* ---------- advanced filter disclosure ---------- */
+
+/* Raag and writer live behind this. They are real filters that are almost
+   never the question, and in the open they turn the panel into a wall. */
+.adv {
+  margin-top: .6rem; padding-top: .6rem;
+  border-top: 1px solid var(--border);
+}
+.adv > summary {
+  cursor: pointer; list-style: none; user-select: none;
+  font-size: .82rem; color: var(--text-dim);
+  display: flex; align-items: center; gap: .4rem;
+}
+.adv > summary::-webkit-details-marker { display: none; }
+.adv > summary::before {
+  content: '▸'; font-size: .7rem; transition: transform .15s ease;
+}
+.adv[open] > summary::before { transform: rotate(90deg); }
+.adv > summary:hover { color: var(--text); }
+.adv > summary .fcount {
+  background: var(--accent); color: #fff;
+  border-radius: 9px; padding: 0 .38rem; font-size: .68rem; font-weight: 600;
+}
+.adv > .chips:first-of-type { margin-top: .5rem; }
+
+/* the per-band tally on a length chip: informative, never the label */
+.chip-n {
+  margin-left: .35rem; font-size: .72rem; opacity: .55;
+  font-variant-numeric: tabular-nums;
+}
+
+/* ---------- similar page filters ---------- */
+
+.sim-filters { margin-bottom: .6rem; }
+.sim-more { display: flex; justify-content: center; padding: 1rem 0 2rem; }
+.sim-more button { min-width: 12rem; }
+
+/* ---------- control panel ---------- */
+
+.status-head {
+  display: flex; align-items: center; gap: .6rem; flex-wrap: wrap;
+  margin-bottom: 1rem;
+}
+.status-head h2 { margin: 0; }
+.status-head .spacer { flex: 1 1 auto; }
+.status-head .mono { font-size: .78rem; }
+
+/* A dot on the gear, since the page has no nav button of its own. */
+#nav-settings.has-alert { position: relative; }
+#nav-settings.has-alert::after {
+  content: ''; position: absolute; top: .25rem; right: .25rem;
+  width: 8px; height: 8px; border-radius: 50%;
+  background: var(--danger); box-shadow: 0 0 0 2px var(--bg);
+}
+
+.alert {
+  padding: .7rem .85rem; border-radius: 8px; margin-bottom: .6rem;
+  border: 1px solid var(--border); border-left-width: 3px;
+  background: var(--surface); line-height: 1.5;
+}
+.alert b { display: block; margin-bottom: .2rem; }
+.alert div { font-size: .88rem; color: var(--text-dim); }
+.alert.error { border-left-color: var(--danger);    background: #2a1c1b; }
+.alert.error b { color: #ffb3b0; }
+.alert.warn  { border-left-color: var(--orange-fg); background: var(--orange-bg); }
+.alert.warn b { color: var(--orange-fg); }
+.alert.info  { border-left-color: var(--accent);    background: var(--blue-bg); }
+.alert.info b { color: var(--blue-fg); }
+.alert.ok    { border-left-color: var(--green-fg);  background: var(--green-bg); }
+.alert.ok b { color: var(--green-fg); }
+
+.st-stats { display: flex; gap: .5rem; flex-wrap: wrap; }
+.st-stat {
+  flex: 1 1 6rem; text-align: center; padding: .7rem .4rem;
+  border-radius: 8px; background: var(--surface-2); border: 1px solid var(--border);
+}
+.st-stat b { display: block; font-size: 1.2rem; }
+.st-stat span {
+  display: block; font-size: .72rem; color: var(--text-faint);
+  text-transform: uppercase; letter-spacing: .04em;
+}
+.st-stat.low { border-color: var(--orange-fg); }
+.st-stat.low b { color: var(--orange-fg); }
+
+.st-model { padding: .7rem 0; border-bottom: 1px solid var(--border); }
+.st-model:last-child { border-bottom: 0; }
+.st-model.off { opacity: .55; }
+.st-model-head {
+  display: flex; align-items: center; gap: .45rem; flex-wrap: wrap;
+  margin-bottom: .4rem;
+}
+.st-model-head .spacer { flex: 1 1 auto; }
+.st-model-head .mono { font-size: .76rem; }
+.st-model-nums { margin-top: .35rem; font-size: .78rem; }
+.flag {
+  font-size: .68rem; text-transform: uppercase; letter-spacing: .04em;
+  padding: .1rem .4rem; border-radius: 4px;
+  background: var(--dim-bg); color: var(--dim-fg);
+}
+.flag.bad { background: var(--orange-bg); color: var(--orange-fg); }
+
+.st-jobs td, .st-jobs th { white-space: nowrap; }
+.job-state {
+  font-size: .7rem; text-transform: uppercase; letter-spacing: .04em;
+  padding: .1rem .4rem; border-radius: 4px;
+  background: var(--dim-bg); color: var(--dim-fg);
+}
+.job-state.done    { background: var(--green-bg);  color: var(--green-fg); }
+.job-state.running { background: var(--blue-bg);   color: var(--blue-fg); }
+.job-state.failed,
+.job-state.stalled { background: #2a1c1b;          color: #ffb3b0; }
+.job-state.stopped { background: var(--orange-bg); color: var(--orange-fg); }
+
+.st-grid {
+  display: grid; gap: .5rem;
+  grid-template-columns: repeat(auto-fit, minmax(6.5rem, 1fr));
+}
+.st-cell {
+  text-align: center; padding: .6rem .3rem; border-radius: 8px;
+  background: var(--surface-2); border: 1px solid var(--border);
+}
+.st-cell b { display: block; font-size: 1.05rem; }
+.st-cell span { display: block; font-size: .72rem; color: var(--text-faint); }
+.st-gaps { margin: .8rem 0 0; font-size: .82rem; line-height: 1.5; }
+
+.st-row { padding: .6rem 0; border-bottom: 1px solid var(--border); }
+.st-row:last-child { border-bottom: 0; }
+.st-row-k { font-size: .72rem; text-transform: uppercase; letter-spacing: .04em;
+            color: var(--text-faint); }
+.st-row-v { margin: .1rem 0; }
+.st-row-why { font-size: .78rem; line-height: 1.45; }
+.st-row-v .ok { color: var(--green-fg); }
+.st-row-v .warn-text { color: var(--orange-fg); }
+
+.st-actions {
+  display: flex; align-items: center; gap: .7rem; flex-wrap: wrap;
+  margin-top: .9rem;
+}
+.st-actions + pre.log { margin-top: .7rem; }
+
+pre.log {
+  margin: 0; padding: .7rem; border-radius: 8px; max-height: 20rem;
+  overflow: auto; font-size: .74rem; line-height: 1.55;
+  background: #141414; border: 1px solid var(--border);
+  color: var(--text-dim); white-space: pre; tab-size: 2;
+}
 .ix-list { margin-top: .8rem; }
 .ix-row {
   display: flex; align-items: center; gap: .6rem;
@@ -805,8 +1015,36 @@ table.scores tr.off { opacity: .45; }
   margin: -1rem -1rem 1rem; padding: .55rem 1rem;
   background: var(--bg); border-bottom: 1px solid var(--border);
 }
-.practice-meta { display: flex; gap: .9rem; align-items: center; }
-#practice-timer { font-variant-numeric: tabular-nums; }
+/* Mode is a control, not a level you unlock -- all three are always available
+   and switching costs nothing. */
+.practice-modes { display: flex; gap: .3rem; flex-wrap: wrap; }
+.mode-btn {
+  font-size: .82rem; padding: .3rem .6rem;
+  background: transparent; border: 1px solid var(--border);
+  color: var(--text-dim);
+}
+.mode-btn.on { border-color: var(--accent); color: var(--accent); background: var(--blue-bg); }
+
+/* Prev/Next always present, in both drill modes. There is no "correct"
+   direction through a shabad you are revising. */
+.drill-nav {
+  display: flex; gap: .6rem; align-items: center; justify-content: space-between;
+  margin-top: 1.6rem; padding-top: 1rem; border-top: 1px solid var(--border);
+}
+.letters {
+  margin-top: .5rem; font-size: 1rem; letter-spacing: .12em;
+  color: var(--text-faint);
+}
+
+/* Perform: the whole shabad as first letters, nothing else on screen. */
+.perform { max-width: 46rem; }
+.perform-line {
+  padding: .6rem 0; border-bottom: 1px solid var(--border); cursor: pointer;
+}
+.perform-line:last-of-type { border-bottom: 0; }
+.perform-line:hover .letters { color: var(--text-dim); }
+.perform-line .letters { margin: 0; font-size: 1.15rem; }
+.perform-line .gurmukhi { margin-top: .35rem; }
 
 .drill {
   padding: 1.4rem 1.2rem;

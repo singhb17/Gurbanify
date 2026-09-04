@@ -14,16 +14,61 @@
  * Whether two lines truly connect is my judgement, not the machine's.
  */
 
-let simState = { lineId: null, data: null };
+const SIM_PAGE = 20;
+
+// `filters` is deliberately NOT part of any persisted state -- see the markup.
+// `shown` accumulates across Show more so paging adds to the list rather than
+// replacing it; changing a filter resets it to one page.
+let simState = { lineId: null, data: null, filters: {}, shown: [], more: false };
 
 async function loadSimilar(lineId) {
   simState.lineId = lineId;
+  simState.filters = {};                   // fresh question, fresh filters
+  simState.shown = [];
   $('similar').innerHTML = '<p class="muted">Looking...</p>';
+  $('sim-more').hidden = true;
+
+  // The chips need the library's option lists. Normally loaded at boot; fetched
+  // here if this view was the entry point (a reloaded /similar/123 url).
+  if (!state.options.length) {
+    try { state.options = await api('/api/filters'); } catch { /* chips stay empty */ }
+  }
+  renderChips('sim-filter-groups', simState.filters, () => {
+    paintFilterCount('sim-filter-count', simState.filters, 'sim-filter-clear');
+    fetchSimilar();                        // refetch: filtering happens server-side
+  });
+  paintFilterCount('sim-filter-count', simState.filters, 'sim-filter-clear');
+  await fetchSimilar();
+}
+
+/* One request per filter change, and that is the right shape.
+ *
+ * The server scores the whole library either way -- ~0.7 ms of numpy -- and
+ * filters BEFORE taking the top 20, so every page comes back full. Filtering a
+ * page of 20 in the browser instead would leave however few of those 20 matched,
+ * and "show more" would exist to paper over that rather than to show more.
+ *
+ * `append` is Show more; anything else replaces the list.
+ */
+async function fetchSimilar(append = false) {
+  const p = new URLSearchParams();
+  p.set('limit', SIM_PAGE);
+  p.set('offset', append ? simState.shown.length : 0);
+  filterParams(simState.filters, p);
+
+  const btn = $('sim-more');
+  btn.disabled = true;
+  if (!append) $('similar').innerHTML = '<p class="muted">Looking...</p>';
   try {
-    simState.data = await api('/api/similar/' + lineId);
+    const d = await api(`/api/similar/${simState.lineId}?${p}`);
+    simState.data = d;
+    simState.shown = append ? [...simState.shown, ...d.results] : d.results;
+    simState.more = !!d.more;
   } catch (err) {
     $('similar').innerHTML = `<p class="muted">Could not load: ${esc(err.message)}</p>`;
     return;
+  } finally {
+    btn.disabled = false;
   }
   renderSimilar();
 }
@@ -52,24 +97,32 @@ function renderSimilar() {
       </div>
     </div>`;
 
-  if (!d.results.length) {
+  if (!simState.shown.length) {
     // An empty list with no explanation reads as "nothing is similar", which is
-    // a very different statement from "this has not been indexed yet".
+    // a very different statement from "this has not been indexed yet" or "your
+    // filters excluded everything" -- three problems with three different fixes.
+    const filtered = countFilters(simState.filters) > 0;
     h += `<div class="empty-state">
-            <p><b>Nothing to compare yet.</b></p>
-            <p class="muted">${d.reason === 'not indexed yet'
-              ? 'No summaries or vectors exist for this line. Run the indexing '
-                + 'pass in <code>search/</code>, then this fills in.'
-              : 'No results came back for this line.'}</p>
-            <p class="muted">Models switched on:
+            <p><b>${filtered ? 'Nothing matches these filters.'
+                             : 'Nothing to compare yet.'}</b></p>
+            <p class="muted">${filtered
+              ? 'Related lines exist, but none are in a shabad matching the '
+                + 'filters above. Clear one and they come back.'
+              : d.reason === 'not indexed yet'
+                ? 'No summaries or vectors exist for this line. Run the indexing '
+                  + 'pass in <code>search/</code>, then this fills in.'
+                : 'No results came back for this line.'}</p>
+            ${filtered ? '' : `<p class="muted">Models switched on:
               ${d.models.length ? d.models.map((m) => esc(m.label)).join(', ')
-                                : '<b>none</b> &mdash; turn one on in Settings'}</p>
+                                : '<b>none</b> &mdash; turn one on in Settings'}</p>`}
           </div>`;
     $('similar').innerHTML = h;
+    $('sim-more').hidden = true;
+    $('sim-count').textContent = '';
     return;
   }
 
-  h += d.results.map((r) => {
+  h += simState.shown.map((r) => {
     // The score is safe to show while blind -- it says how close the match is,
     // not who found it. Only the model NAME is withheld.
     const who = Object.entries(r.by)
@@ -103,6 +156,9 @@ function renderSimilar() {
   }).join('');
 
   $('similar').innerHTML = h;
+  $('sim-more').hidden = !simState.more;
+  $('sim-count').textContent = `${simState.shown.length} shown`
+    + (simState.more ? '' : ' — that’s all');
 }
 
 // Delegated: the list is rebuilt after every vote, so per-node handlers would
@@ -121,7 +177,7 @@ $('similar').addEventListener('click', async (e) => {
   const card = btn.closest('.sim-result');
   const resultId = Number(card.dataset.result);
   const want = Number(btn.dataset.v);
-  const row = simState.data.results.find((r) => r.id === resultId);
+  const row = simState.shown.find((r) => r.id === resultId);
   // clicking the same thumb again clears it, so a mis-tap is undoable
   const verdict = row.verdict === want ? 0 : want;
   row.verdict = verdict;
@@ -149,6 +205,16 @@ $('similar').addEventListener('keydown', (e) => {
 
 $('sim-blind').onchange = renderSimilar;
 $('sim-back').onclick = goBack;
+$('sim-more').onclick = () => fetchSimilar(true);
+$('sim-filter-clear').onclick = () => {
+  simState.filters = {};
+  renderChips('sim-filter-groups', simState.filters, () => {
+    paintFilterCount('sim-filter-count', simState.filters, 'sim-filter-clear');
+    fetchSimilar();
+  });
+  paintFilterCount('sim-filter-count', simState.filters, 'sim-filter-clear');
+  fetchSimilar();
+};
 $('sim-open').onclick = () => {
   const q = simState.data && simState.data.query;
   if (q) go('detail', { id: q.shabad_id });

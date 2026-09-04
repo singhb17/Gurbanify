@@ -26,11 +26,17 @@
   },
   "glm47nt": {
     "id": "z-ai/glm-4.7",
+    "_provider": "Eight providers serve this model from $0.40 to $0.60/M in -- a 50% spread for identical weights. DeepInfra is both the cheapest and up; allow_fallbacks keeps the run alive if it goes down, just at a worse price. Pinned after DeepSeek doubled in price mid-project.",
     "options": {
       "reasoning": {
         "enabled": false
+      },
+      "provider": {
+        "order": ["DeepInfra"],
+        "allow_fallbacks": true
       }
     },
+    "max_tokens_per_line": 1200,
     "tokens_per_line": 812
   },
   "glm5nt": {
@@ -73,7 +79,9 @@
       }
     },
     "max_tokens_per_line": 1200,
-    "tokens_per_line": 743
+    "tokens_per_line": 743,
+    "_workers": "6 parallel calls tripped new-account-rpm on 60%+ of lines. 2 is what this provider tolerates on a low-credit account; raise it once the account has more history.",
+    "workers": 2
   },
   "geminilite": {
     "id": "google/gemini-3.1-flash-lite",

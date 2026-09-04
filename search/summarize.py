@@ -107,6 +107,19 @@ class Fatal(Exception):
     """Something retrying cannot fix -- no credit, bad key, unknown model."""
 
 
+# A 429 means "later", not "no". OpenRouter's per-minute limit for an account
+# scales with how much credit has been bought, so a new account hits it with
+# settings that are fine for an older one -- and the failure is total for the
+# lines it touches while costing nothing, which makes it pure waste.
+#
+# Given its own retry budget, separate from `tries`. Mixing the two spends the
+# whole allowance on being told to wait, and then reports the line as broken
+# when nothing was ever wrong with it.
+RATE_TRIES = 6
+RATE_BACKOFF = 8.0                      # seconds, x how many times we've been told
+RATE_JITTER = 3.0
+
+
 def call(key, model, text, tries=3, timeout=75, extra=None):
     """75s, 3 tries. The old 120s x 4 meant one stuck line could hold the run
     for eight minutes before anyone found out something was wrong.
@@ -117,6 +130,7 @@ def call(key, model, text, tries=3, timeout=75, extra=None):
     60-word answer, and output is billed at 4-5x input, so the switch is worth
     far more than the sticker price difference between models.
     """
+    import random
     import requests
     body = {"model": model, "temperature": 0.2,
             "messages": [{"role": "system", "content": SYSTEM},
@@ -124,7 +138,9 @@ def call(key, model, text, tries=3, timeout=75, extra=None):
     if extra:
         body.update(extra)
     last = None
-    for attempt in range(tries):
+    rate_hits = 0
+    attempt = 0
+    while attempt < tries:
         try:
             r = requests.post(API_URL, timeout=timeout, json=body, headers={
                 "Authorization": f"Bearer {key}",
@@ -138,13 +154,29 @@ def call(key, model, text, tries=3, timeout=75, extra=None):
             # time and, where a call half-succeeds, money. Stop immediately.
             if r.status_code in (400, 401, 402, 403, 404):
                 raise Fatal(f"{r.status_code}: {r.json().get('error', {}).get('message', r.text)[:180]}")
+            if r.status_code == 429:
+                rate_hits += 1
+                last = f"429 {r.text[:160]}"
+                if rate_hits > RATE_TRIES:
+                    break
+                # Honour Retry-After when the server sends one; otherwise back
+                # off further each time. The jitter is the part that matters:
+                # without it every worker sleeps the same duration and wakes in
+                # lockstep, so they trip the same limit together and the pool
+                # converges on failing in unison rather than spreading out.
+                wait = float(r.headers.get("Retry-After") or 0) or RATE_BACKOFF * rate_hits
+                time.sleep(wait + random.uniform(0, RATE_JITTER))
+                continue                            # not one of the `tries`
             last = f"{r.status_code} {r.text[:160]}"
         except Fatal:
             raise
         except Exception as e:                      # network flake, not a bug
             last = str(e)
-        time.sleep(1.5 * (attempt + 1))             # back off, then try again
-    raise RuntimeError(f"failed after {tries} tries: {last}")
+        attempt += 1
+        time.sleep(1.5 * attempt)                   # back off, then try again
+    raise RuntimeError(f"failed after {attempt} tries"
+                       + (f" and {rate_hits} rate limits" if rate_hits else "")
+                       + f": {last}")
 
 
 def list_models(key):
@@ -160,7 +192,8 @@ def list_models(key):
                   f"  out ${float(p.get('completion', 0))*1e6:.2f} /M")
 
 
-def summarise_rows(key, model, rows, workers=6, extra=None, max_tpl=None, probe=12):
+def summarise_rows(key, model, rows, workers=6, extra=None, max_tpl=None, probe=12,
+                   should_stop=None):
     """Summarise every row, returning whatever succeeded.
 
     A line that keeps failing must NOT throw away the ones that worked. The
@@ -191,7 +224,13 @@ def summarise_rows(key, model, rows, workers=6, extra=None, max_tpl=None, probe=
     lock = threading.Lock()
 
     def one(row):
-        if stop[0]:                     # budget already blown; ask for nothing
+        # Two ways to stop asking for more: the runaway guard below, and the
+        # app asking us to. Both land in the same place because the response is
+        # identical -- request nothing further, keep everything already bought.
+        if stop[0]:
+            return row, None
+        if should_stop and should_stop():
+            stop[0] = "stopped from the app"
             return row, None
         try:
             txt, u = call(key, model, prompt_for(row), extra=extra)
@@ -221,7 +260,8 @@ def summarise_rows(key, model, rows, workers=6, extra=None, max_tpl=None, probe=
     if stop[0]:
         print(f"  STOPPED EARLY: {stop[0]}")
         print(f"  kept {len(out)} lines; the rest were never requested.")
-        print("  the reasoning switch is not being honoured for this model.")
+        if "token" in stop[0]:          # the runaway guard, not a deliberate stop
+            print("  the reasoning switch is not being honoured for this model.")
     if failed:
         print(f"  {len(failed)} line(s) failed and were skipped:")
         for g, err in failed[:5]:

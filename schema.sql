@@ -101,24 +101,25 @@ CREATE TABLE IF NOT EXISTS history (
 -- Shabads I'm working on memorising. Separate from `shortlist` on purpose: a
 -- shabad can be in both, either or neither -- wanting to sing something and
 -- wanting to commit it to memory are different intentions.
+--
+-- A LIST, nothing more. There was a full SM-2 layer here once -- per-line ease
+-- factors, six scaffold levels, a rahao meaning gate, daily new-material caps,
+-- interval scheduling in a `learning_lines` table. It was built carefully and
+-- never used. Scheduling was the reason: being told what to practise and when
+-- turns something you want to do into something you are behind on. Deleted
+-- rather than tuned.
+--
+-- `last_practised` is information, never a schedule. Nothing reads it to decide
+-- what you should do next.
 CREATE TABLE IF NOT EXISTS learning (
-  shabad_id  INTEGER PRIMARY KEY REFERENCES shabads(id) ON DELETE CASCADE,
-  added_at   TEXT NOT NULL DEFAULT (datetime('now')),
-  rahao_ok   INTEGER NOT NULL DEFAULT 0    -- the meaning gate; unlocks drilling
-);
-
--- Per-line SM-2 state. WHICH LINES HAVE A ROW HERE IS THE SCOPE -- a line
--- selector added later just inserts or deletes rows, no migration needed.
-CREATE TABLE IF NOT EXISTS learning_lines (
-  line_id     INTEGER PRIMARY KEY REFERENCES lines(id) ON DELETE CASCADE,
-  shabad_id   INTEGER NOT NULL REFERENCES shabads(id) ON DELETE CASCADE,
-  level       INTEGER NOT NULL DEFAULT 0,   -- rung of the scaffold, 0..MAX_LEVEL
-  ease        REAL    NOT NULL DEFAULT 2.5, -- SM-2 ease factor
-  interval_d  REAL    NOT NULL DEFAULT 0,   -- days until the next review
-  reps        INTEGER NOT NULL DEFAULT 0,
-  lapses      INTEGER NOT NULL DEFAULT 0,
-  due         TEXT,                          -- YYYY-MM-DD. NULL = never seen
-  last_review TEXT
+  shabad_id      INTEGER PRIMARY KEY REFERENCES shabads(id) ON DELETE CASCADE,
+  added_at       TEXT NOT NULL DEFAULT (datetime('now')),
+  -- 'not_started' | 'in_progress' | 'memorized'. Set by hand, never derived:
+  -- nothing measures your recall any more, so only you can say where a shabad
+  -- has got to. Three states, because a scale fine enough to agonise over is
+  -- the app having an opinion again.
+  status         TEXT NOT NULL DEFAULT 'not_started',
+  last_practised TEXT
 );
 
 -- ---------------------------------------------------------------------------
@@ -216,8 +217,6 @@ CREATE TABLE IF NOT EXISTS settings (
   value  TEXT NOT NULL
 );
 
-CREATE INDEX IF NOT EXISTS idx_learning_due ON learning_lines(due);
-CREATE INDEX IF NOT EXISTS idx_learning_shabad ON learning_lines(shabad_id);
 CREATE INDEX IF NOT EXISTS idx_relations_result ON line_relations(result_line_id);
 CREATE INDEX IF NOT EXISTS idx_model_results_model ON model_results(model);
 
