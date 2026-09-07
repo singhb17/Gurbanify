@@ -7,14 +7,49 @@
 
 PRAGMA foreign_keys = ON;
 
+-- ---------------------------------------------------------------------------
+-- Accounts (CLAUDE.md §16)
+--
+-- Several people, one database -- never one file each, which would make every
+-- cross-account question impossible and force a rewrite the day this goes
+-- public. The split that makes it work is `shabads` (shared catalogue) versus
+-- `user_shabads` (who has it, and what they think of it).
+-- ---------------------------------------------------------------------------
+
+CREATE TABLE IF NOT EXISTS users (
+  id            INTEGER PRIMARY KEY,
+  username      TEXT NOT NULL UNIQUE COLLATE NOCASE,
+  -- scrypt, salted, from hashlib. Never a fast hash: speed is what an attacker
+  -- with this file wants, because it buys them billions of guesses.
+  password_hash TEXT NOT NULL,
+  is_admin      INTEGER NOT NULL DEFAULT 0,
+  created_at    TEXT NOT NULL DEFAULT (datetime('now'))
+);
+
+CREATE TABLE IF NOT EXISTS sessions (
+  token      TEXT PRIMARY KEY,
+  user_id    INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+  created_at TEXT NOT NULL DEFAULT (datetime('now')),
+  expires_at TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_sessions_user ON sessions(user_id);
+
+-- THE SHARED CATALOGUE. Identity and raw text only -- nothing here belongs to
+-- anybody. One row per shabad that exists, whoever added it first.
+--
+-- This is what makes a second account nearly free: its `lines` and their
+-- summaries and vectors already exist, so adding a shabad somebody else already
+-- has is one INSERT into user_shabads and is searchable immediately.
 CREATE TABLE IF NOT EXISTS shabads (
   id                INTEGER PRIMARY KEY,
 
   -- raw / identity
   banidb_shabad_id  INTEGER UNIQUE,       -- NULL for manually entered shabads
-  source_line       TEXT NOT NULL,        -- the line as it appeared in my Notion export
+  source_line       TEXT NOT NULL,        -- the line it is filed under by default
   source_line_no    INTEGER,              -- which verse in `lines` that is, so the UI
                                           -- can highlight it. NULL if it didn't match.
+                                          -- Per-person overrides live in
+                                          -- user_shabads.source_line_no.
                                           -- (no first_line column: it was always just
                                           -- lines.line_no=1, and that's the raag/mahalla
                                           -- header, not a tuk. Read it from `lines` if
@@ -26,22 +61,38 @@ CREATE TABLE IF NOT EXISTS shabads (
   source_en         TEXT,                 -- e.g. "Sri Guru Granth Sahib Ji"
   source_pa         TEXT,
 
-  -- mine
-  rarity            TEXT,
-  status            TEXT,
-  notes             TEXT,
-  -- (no last_done / recording_url / tune_source -- dropped as unused: a date
-  --  maintained by hand never gets maintained. last_surfaced below is the
-  --  replacement, and the app writes it itself.)
-
-  -- written by the swipe deck, never by hand. Drives the recency weighting:
-  -- the longer since a shabad was surfaced, the likelier it is to come up.
-  -- NULL = never surfaced, which is treated as the longest gap of all.
-  last_surfaced     TEXT,
-
   is_user_added     INTEGER NOT NULL DEFAULT 0,
   imported_at       TEXT
 );
+
+-- MY library: which catalogue entries I have, and everything I think about
+-- them. The "mine" layer of §5, now keyed by account.
+--
+-- rarity/status/notes/last_surfaced lived on `shabads` before the multi-account
+-- split; they are the reason the split had to happen, because they are the one
+-- part of a shabad that differs from person to person.
+CREATE TABLE IF NOT EXISTS user_shabads (
+  user_id       INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+  shabad_id     INTEGER NOT NULL REFERENCES shabads(id) ON DELETE CASCADE,
+
+  rarity        TEXT,
+  status        TEXT,
+  notes         TEXT,
+  -- (no last_done / recording_url / tune_source -- dropped as unused: a date
+  --  maintained by hand never gets maintained. last_surfaced is the
+  --  replacement, and the app writes it itself.)
+
+  -- written by the swipe deck, never by hand. NULL = never surfaced.
+  last_surfaced TEXT,
+
+  -- Which line I know it by. Personal: two people can file the same shabad
+  -- under different tuks. NULL means "whatever the catalogue says".
+  source_line_no INTEGER,
+
+  added_at      TEXT NOT NULL DEFAULT (datetime('now')),
+  PRIMARY KEY (user_id, shabad_id)
+);
+CREATE INDEX IF NOT EXISTS idx_user_shabads_user ON user_shabads(user_id);
 
 CREATE TABLE IF NOT EXISTS lines (
   id                 INTEGER PRIMARY KEY,
@@ -68,11 +119,13 @@ CREATE TABLE IF NOT EXISTS lines (
 -- Keeping these in one table means a new tag dimension needs no migration,
 -- and "filter by any tag" is a single query shape.
 CREATE TABLE IF NOT EXISTS tags (
+  user_id    INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
   shabad_id  INTEGER NOT NULL REFERENCES shabads(id) ON DELETE CASCADE,
   kind       TEXT NOT NULL,
   value      TEXT NOT NULL,
-  PRIMARY KEY (shabad_id, kind, value)
+  PRIMARY KEY (user_id, shabad_id, kind, value)
 );
+CREATE INDEX IF NOT EXISTS idx_tags_user ON tags(user_id);
 
 -- Shortlists built by swiping right. Kept out of `tags` on purpose: tags
 -- describe what a shabad IS (its genre, its speed) and are edited one shabad at
@@ -83,10 +136,11 @@ CREATE TABLE IF NOT EXISTS tags (
 -- `list` exists now although there is only one folder, so a second one later is
 -- a no-op instead of a migration.
 CREATE TABLE IF NOT EXISTS shortlist (
+  user_id    INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
   shabad_id  INTEGER NOT NULL REFERENCES shabads(id) ON DELETE CASCADE,
   list       TEXT NOT NULL DEFAULT 'Interested',
   added_at   TEXT NOT NULL DEFAULT (datetime('now')),
-  PRIMARY KEY (shabad_id, list)          -- swiping right twice is not an error
+  PRIMARY KEY (user_id, shabad_id, list) -- swiping right twice is not an error
 );
 
 -- What I actually opened, newest last. An append-only log, NOT a set: opening
@@ -94,9 +148,11 @@ CREATE TABLE IF NOT EXISTS shortlist (
 -- one" is the interesting signal. Trimmed to the most recent HISTORY_LIMIT.
 CREATE TABLE IF NOT EXISTS history (
   id         INTEGER PRIMARY KEY,
+  user_id    INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
   shabad_id  INTEGER NOT NULL REFERENCES shabads(id) ON DELETE CASCADE,
   opened_at  TEXT NOT NULL DEFAULT (datetime('now'))
 );
+CREATE INDEX IF NOT EXISTS idx_history_user ON history(user_id);
 
 -- Shabads I'm working on memorising. Separate from `shortlist` on purpose: a
 -- shabad can be in both, either or neither -- wanting to sing something and
@@ -112,14 +168,16 @@ CREATE TABLE IF NOT EXISTS history (
 -- `last_practised` is information, never a schedule. Nothing reads it to decide
 -- what you should do next.
 CREATE TABLE IF NOT EXISTS learning (
-  shabad_id      INTEGER PRIMARY KEY REFERENCES shabads(id) ON DELETE CASCADE,
+  user_id        INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+  shabad_id      INTEGER NOT NULL REFERENCES shabads(id) ON DELETE CASCADE,
   added_at       TEXT NOT NULL DEFAULT (datetime('now')),
   -- 'not_started' | 'in_progress' | 'memorized'. Set by hand, never derived:
   -- nothing measures your recall any more, so only you can say where a shabad
   -- has got to. Three states, because a scale fine enough to agonise over is
   -- the app having an opinion again.
   status         TEXT NOT NULL DEFAULT 'not_started',
-  last_practised TEXT
+  last_practised TEXT,
+  PRIMARY KEY (user_id, shabad_id)
 );
 
 -- ---------------------------------------------------------------------------
@@ -163,11 +221,15 @@ CREATE TABLE IF NOT EXISTS line_summaries (
 -- must be backed up. Months of these become the ground-truth set that lets any
 -- future model be evaluated for free, on the real library.
 CREATE TABLE IF NOT EXISTS line_relations (
+  -- Per account. A shared tally would average my judgement of which model is
+  -- better with somebody else's, and the value of these votes is precisely
+  -- that they are ONE person's considered opinion about Gurbani.
+  user_id         INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
   query_line_id   INTEGER NOT NULL REFERENCES lines(id) ON DELETE CASCADE,
   result_line_id  INTEGER NOT NULL REFERENCES lines(id) ON DELETE CASCADE,
   verdict         INTEGER NOT NULL,          -- +1 connected, -1 unrelated
   judged_at       TEXT NOT NULL DEFAULT (datetime('now')),
-  PRIMARY KEY (query_line_id, result_line_id)
+  PRIMARY KEY (user_id, query_line_id, result_line_id)
 );
 
 -- DERIVED: which model offered which result, and how prominently. Kept apart

@@ -35,6 +35,7 @@ async function loadStatus() {
   renderModels(d.models);
   renderJobs(d.jobs);
   renderLibrary(d.library);
+  renderUsers();
   renderBackups(d.backups);
   renderSystem(d);
   $('st-log').textContent = d.log.length ? d.log.join('\n') : 'Log is empty.';
@@ -140,6 +141,7 @@ function renderJobs(jobs) {
 
 function renderLibrary(c) {
   const rows = [
+    ['Accounts', c.accounts],
     ['Shabads', c.shabads], ['Lines', c.lines], ['Tags', c.tags],
     ['Interested', c.shortlist], ['Learning', c.learning],
     ['Opens logged', c.history], ['Similarity votes', c.votes],
@@ -158,6 +160,87 @@ function renderLibrary(c) {
       and ${fmt(c.no_english)} have no English translation. BaniDB simply does
       not carry them; the gap is left visible rather than filled in.</p>`;
 }
+
+/* Account management. Deliberately plain: three actions, each a prompt, no
+ * forms to design for something used perhaps twice a year. */
+async function renderUsers() {
+  let d;
+  try {
+    d = await api('/api/admin/users');
+  } catch (err) {
+    $('st-users').innerHTML = `<p class="muted">Could not load: ${esc(err.message)}</p>`;
+    return;
+  }
+  $('st-users').innerHTML = `
+    <div class="st-rows">${d.users.map((u) => `
+      <div class="st-row user-row" data-id="${u.id}">
+        <div class="st-row-k">${u.is_admin ? 'admin' : 'account'}${
+          u.id === d.me ? ' · you' : ''}</div>
+        <div class="st-row-v"><b>${esc(u.username)}</b></div>
+        <div class="st-row-why muted">
+          ${fmt(u.shabads)} shabads ·
+          ${u.sessions ? u.sessions + ' signed-in device' + (u.sessions === 1 ? '' : 's')
+                       : 'not signed in'} ·
+          since ${esc((u.created_at || '').slice(0, 10))}
+        </div>
+        <div class="user-actions">
+          <button class="secondary u-pass" data-id="${u.id}"
+                  data-name="${esc(u.username)}">Reset password</button>
+          ${u.id === d.me ? ''
+            : `<button class="danger u-del" data-id="${u.id}"
+                       data-name="${esc(u.username)}">Delete</button>`}
+        </div>
+      </div>`).join('')}
+    </div>`;
+}
+
+$('st-add-user').onclick = async () => {
+  const name = prompt('Username for the new account:');
+  if (!name) return;
+  const pw = prompt(`Password for ${name} (at least 8 characters):`);
+  if (!pw) return;
+  try {
+    await api('/api/admin/users', json('POST', { username: name, password: pw }));
+    toast(`Created ${name}`);
+    renderUsers();
+  } catch (err) { toast(err.message, true); }
+};
+
+$('st-users').addEventListener('click', async (e) => {
+  const pass = e.target.closest('.u-pass');
+  if (pass) {
+    const pw = prompt(`New password for ${pass.dataset.name} `
+                    + '(at least 8 characters).\n\nThis signs them out everywhere.');
+    if (!pw) return;
+    try {
+      await api(`/api/admin/users/${pass.dataset.id}/password`,
+                json('POST', { password: pw }));
+      toast('Password changed; they will need to sign in again');
+      renderUsers();
+    } catch (err) { toast(err.message, true); }
+    return;
+  }
+  const del = e.target.closest('.u-del');
+  if (del) {
+    // The one genuinely destructive button in the app, so it asks with the
+    // name typed back -- a mis-tap cannot delete somebody's library.
+    const typed = prompt(
+      `Delete ${del.dataset.name} and EVERYTHING in their library — shabads, `
+      + 'tags, notes, shortlist, learning list, votes?\n\n'
+      + 'The Gurbani itself is kept, since others may have the same shabads.\n\n'
+      + `Type the username to confirm:`);
+    if (typed !== del.dataset.name) {
+      if (typed !== null) toast('Name did not match; nothing deleted');
+      return;
+    }
+    try {
+      await api('/api/admin/users/' + del.dataset.id, { method: 'DELETE' });
+      toast(`Deleted ${del.dataset.name}`);
+      renderUsers();
+      loadStatus();
+    } catch (err) { toast(err.message, true); }
+  }
+});
 
 function renderBackups(b) {
   $('st-backups').innerHTML = b.age_days === null

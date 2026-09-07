@@ -19,13 +19,31 @@ const SIM_PAGE = 20;
 // `filters` is deliberately NOT part of any persisted state -- see the markup.
 // `shown` accumulates across Show more so paging adds to the list rather than
 // replacing it; changing a filter resets it to one page.
-let simState = { lineId: null, data: null, filters: {}, shown: [], more: false };
+let simState = { lineId: null, data: null, filters: {}, shown: [], more: false,
+                 scope: 'mine' };
+
+/* Do we already have this exact question loaded?
+ *
+ * app.js asks before deciding whether Back can reuse the page. Same line and
+ * results in hand means everything -- filters, scope, the extra pages you
+ * pulled in with Show more, the scroll position -- survives a trip into a
+ * result and back. */
+function simHasQuery(lineId) {
+  return simState.lineId != null
+      && String(simState.lineId) === String(lineId)
+      && simState.shown.length > 0;
+}
 
 async function loadSimilar(lineId) {
+  // A DIFFERENT line is a different question, so it starts clean. The same line
+  // keeps what you set up -- reloading the page after a Back would otherwise
+  // silently throw away a filter and a scope you had just chosen.
+  if (!simHasQuery(lineId)) {
+    simState.filters = {};
+    simState.scope = 'mine';               // always start inside my library
+    simState.shown = [];
+  }
   simState.lineId = lineId;
-  simState.filters = {};                   // fresh question, fresh filters
-  simState.shown = [];
-  $('similar').innerHTML = '<p class="muted">Looking...</p>';
   $('sim-more').hidden = true;
 
   // The chips need the library's option lists. Normally loaded at boot; fetched
@@ -33,12 +51,14 @@ async function loadSimilar(lineId) {
   if (!state.options.length) {
     try { state.options = await api('/api/filters'); } catch { /* chips stay empty */ }
   }
-  renderChips('sim-filter-groups', simState.filters, () => {
-    paintFilterCount('sim-filter-count', simState.filters, 'sim-filter-clear');
-    fetchSimilar();                        // refetch: filtering happens server-side
-  });
-  paintFilterCount('sim-filter-count', simState.filters, 'sim-filter-clear');
+  paintScope();
+  renderSimFilters();
   await fetchSimilar();
+}
+
+function paintScope() {
+  for (const x of $('view-similar').querySelectorAll('[data-scope]'))
+    x.classList.toggle('on', x.dataset.scope === simState.scope);
 }
 
 /* One request per filter change, and that is the right shape.
@@ -54,6 +74,7 @@ async function fetchSimilar(append = false) {
   const p = new URLSearchParams();
   p.set('limit', SIM_PAGE);
   p.set('offset', append ? simState.shown.length : 0);
+  p.set('scope', simState.scope);
   filterParams(simState.filters, p);
 
   const btn = $('sim-more');
@@ -133,10 +154,18 @@ function renderSimilar() {
     // matched is rarely the line the shabad is filed under, so it also shows
     // which shabad this is, the way the library list does.
     const own = r.line_no === r.source_line_no;
+    // A result from outside my library cannot be opened -- I do not have that
+    // shabad -- so the card offers to add it instead. That is the whole point
+    // of Everything mode: find something new, keep it.
+    const foreign = r.in_library === false;
     return `
-      <div class="sim-result tappable ${r.verdict > 0 ? 'voted-up' : r.verdict < 0 ? 'voted-down' : ''}"
+      <div class="sim-result ${foreign ? 'foreign' : 'tappable'} ${
+             r.verdict > 0 ? 'voted-up' : r.verdict < 0 ? 'voted-down' : ''}"
            data-result="${r.id}" data-shabad="${r.shabad_id}"
-           role="button" tabindex="0" title="Open this shabad at this line">
+           data-banidb="${r.banidb_shabad_id || ''}" data-lineno="${r.line_no}"
+           ${foreign ? '' : 'role="button" tabindex="0"'}
+           title="${foreign ? 'Not in your library yet'
+                            : 'Open this shabad at this line'}">
         <div class="sim-score" title="cosine similarity">${r.score.toFixed(3)}</div>
         ${texts(r)}
         <div class="sim-from">
@@ -144,6 +173,8 @@ function renderSimilar() {
                 : `<span class="muted">from</span>
                    <span class="gur-sm">${esc(r.source_line)}</span>`}
           <span class="muted sim-len">${r.line_count} lines</span>
+          ${foreign ? `<button class="sim-add" data-result="${r.id}">
+                         + Add to my library</button>` : ''}
         </div>
         <div class="sim-foot">
           <button class="vote up ${r.verdict > 0 ? 'on' : ''}"
@@ -157,13 +188,40 @@ function renderSimilar() {
 
   $('similar').innerHTML = h;
   $('sim-more').hidden = !simState.more;
+  const isNew = simState.shown.filter((r) => r.in_library === false).length;
   $('sim-count').textContent = `${simState.shown.length} shown`
+    + (isNew ? ` · ${isNew} not in your library` : '')
     + (simState.more ? '' : ' — that’s all');
 }
 
 // Delegated: the list is rebuilt after every vote, so per-node handlers would
 // be dead on the second click.
 $('similar').addEventListener('click', async (e) => {
+  // Add a discovered shabad, filed under the line that brought me here --
+  // which is exactly how source_line is meant to be chosen.
+  const add = e.target.closest('.sim-add');
+  if (add) {
+    e.stopPropagation();
+    const card = add.closest('.sim-result');
+    const banidb = Number(card.dataset.banidb);
+    if (!banidb) { toast('That shabad has no BaniDB id to add from', true); return; }
+    add.disabled = true;
+    try {
+      await api('/api/shabads', json('POST', {
+        banidb_shabad_id: banidb,
+        source_line_no: Number(card.dataset.lineno),
+      }));
+      toast('Added to your library');
+      const row = simState.shown.find((r) => r.id === Number(card.dataset.result));
+      if (row) row.in_library = true;
+      renderSimilar();
+    } catch (err) {
+      add.disabled = false;
+      toast(err.message, true);
+    }
+    return;
+  }
+
   const btn = e.target.closest('.vote');
   if (!btn) {
     // Anywhere else on the card opens the shabad at this line. As in the shabad
@@ -206,13 +264,43 @@ $('similar').addEventListener('keydown', (e) => {
 $('sim-blind').onchange = renderSimilar;
 $('sim-back').onclick = goBack;
 $('sim-more').onclick = () => fetchSimilar(true);
-$('sim-filter-clear').onclick = () => {
-  simState.filters = {};
+
+/* My library vs everything indexed.
+ *
+ * Personal filters (status, rarity, genre, speed) describe MY opinion of a
+ * shabad, so they cannot mean anything for one I don't have. Under Everything
+ * they are hidden rather than silently ignored -- a filter that appears to be
+ * on but isn't is worse than one that isn't there. */
+$('view-similar').querySelectorAll('[data-scope]').forEach((b) => {
+  b.onclick = () => {
+    if (simState.scope === b.dataset.scope) return;
+    simState.scope = b.dataset.scope;
+    paintScope();
+    // drop filters that no longer apply, so the count cannot lie
+    if (simState.scope === 'all')
+      for (const k of ['status', 'rarity', 'genre', 'speed']) delete simState.filters[k];
+    renderSimFilters();
+    fetchSimilar();
+  };
+});
+
+function renderSimFilters() {
+  const wide = simState.scope === 'all';
   renderChips('sim-filter-groups', simState.filters, () => {
     paintFilterCount('sim-filter-count', simState.filters, 'sim-filter-clear');
     fetchSimilar();
   });
+  // hide the personal groups under Everything
+  for (const g of $('sim-filter-groups').querySelectorAll('.chips')) {
+    const kind = g.querySelector('b');
+    if (kind && wide && ['status', 'rarity', 'genre', 'speed'].includes(kind.textContent))
+      g.hidden = true;
+  }
   paintFilterCount('sim-filter-count', simState.filters, 'sim-filter-clear');
+}
+$('sim-filter-clear').onclick = () => {
+  simState.filters = {};
+  renderSimFilters();
   fetchSimilar();
 };
 $('sim-open').onclick = () => {

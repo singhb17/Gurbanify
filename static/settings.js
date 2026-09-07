@@ -11,8 +11,31 @@
  */
 
 async function loadSettings() {
-  await Promise.all([loadPrefs(), loadModelToggles(), loadScores()]);
+  await Promise.all([loadMe(), loadPrefs(), loadModelToggles(), loadScores()]);
 }
+
+/* Who is signed in, and whether the admin-only machinery should be on screen.
+ *
+ * Hiding it is a courtesy, not the defence: the server refuses those endpoints
+ * with a 403 whatever the page shows. A UI-only check would be security by
+ * politeness, which is no security at all. */
+async function loadMe() {
+  try {
+    const me = await api('/api/me');
+    window.ME = me;
+    $('me-name').textContent = me.username;
+    $('me-role').textContent = me.is_admin
+      ? 'Administrator — you can manage accounts and indexing'
+      : 'Your library is private to this account';
+    for (const el of document.querySelectorAll('[data-admin]'))
+      el.hidden = !me.is_admin;
+  } catch { /* the middleware would have redirected if we were not signed in */ }
+}
+
+$('sign-out').onclick = async () => {
+  try { await api('/api/logout', json('POST', {})); } catch { /* going anyway */ }
+  window.location.href = '/login';
+};
 
 async function loadPrefs() {
   try {

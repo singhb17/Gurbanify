@@ -1,0 +1,60 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Shabad Library — sign in</title>
+<link rel="stylesheet" href="/static/style.css">
+</head>
+<body class="login-body">
+
+<form id="login" class="login-card" autocomplete="on">
+  <h1>Shabad Library</h1>
+  <p class="muted">Sign in to your library.</p>
+
+  <label for="u">Username</label>
+  <input id="u" name="username" autocomplete="username" autocapitalize="off"
+         autocorrect="off" spellcheck="false" required autofocus>
+
+  <label for="p">Password</label>
+  <input id="p" name="password" type="password" autocomplete="current-password" required>
+
+  <button id="go" type="submit">Sign in</button>
+  <div id="err" class="login-err" hidden></div>
+</form>
+
+<script>
+const $ = (id) => document.getElementById(id);
+
+$('login').onsubmit = async (e) => {
+  e.preventDefault();
+  const btn = $('go');
+  const err = $('err');
+  btn.disabled = true;
+  err.hidden = true;
+  try {
+    const res = await fetch('/api/login', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ username: $('u').value, password: $('p').value }),
+    });
+    if (!res.ok) {
+      let msg = 'Wrong username or password';
+      try { msg = (await res.json()).detail || msg; } catch { /* keep the default */ }
+      throw new Error(msg);
+    }
+    // A full navigation rather than a redirect fetch, so the browser stores the
+    // cookie and the app boots with it already in place.
+    window.location.href = '/';
+  } catch (e2) {
+    err.textContent = e2.message;
+    err.hidden = false;
+    $('p').value = '';
+    $('p').focus();
+  } finally {
+    btn.disabled = false;
+  }
+};
+</script>
+</body>
+</html>

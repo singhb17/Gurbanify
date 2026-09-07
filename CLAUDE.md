@@ -6,7 +6,9 @@ Handoff document. Everything decided so far, with reasoning. Read fully before w
 
 ## 1. What this is
 
-A personal shabad repertoire manager. **Single user. No auth system beyond gating access. No multi-tenancy. Do not build for other users.**
+A personal shabad repertoire manager. **A handful of accounts — me, my dad, maybe a friend. Not a public product.**
+
+> This said "single user, no multi-tenancy, do not build for other users" until 2026-09-04. It changed deliberately, and §16 records the whole design. The spirit of the original rule survives: build for a few people who know each other, not for the internet.
 
 I do keertan in the AKJ tradition. When I hear or come across a shabad I want to learn or perform, I note it down. I need to store those, filter them, rediscover old ones, and find thematically related shabads across my collection.
 
@@ -358,6 +360,40 @@ The same applies to translations and teekas — read them from the database, do 
 ## 14. How I want to work
 
 I'm learning as I build this. Explain the reasoning behind approaches rather than just producing code — I want to understand what's happening and pick up proper practices, including things like keeping secrets out of the frontend. Push back if I'm heading somewhere wrong.
+
+---
+
+## 16. Multiple accounts — BUILT (2026-09-04)
+
+Me, my dad, maybe a friend. **Libraries are completely private; the Gurbani is completely shared.**
+
+**One database, never a file per person.** A file each makes every cross-account question impossible, throws away the shared indexing below, and guarantees a rewrite the day this goes public.
+
+**The split that makes it work** — `shabads` was doing two jobs, and separating them *is* the migration:
+
+| | |
+|---|---|
+| **`shabads`** | shared catalogue. Identity and raw text. One row per shabad in existence. |
+| **`user_shabads`** | one row per (person, shabad): their status, rarity, notes, `last_surfaced`, and which line they know it by. |
+
+`lines`, `line_summaries` and vectors hang off the catalogue, so they are shared too. `tags`, `shortlist`, `history`, `learning` and `line_relations` gained a `user_id`.
+
+**Indexing cost stops scaling with people.** A shabad Dad adds that I already have is one `INSERT` — its summaries and vectors exist, so it costs nothing and is searchable immediately. A genuinely new one is indexed once and *I* get it free too. **The more accounts, the more of SGGS is indexed, and everyone's search improves.**
+
+**The leak this design could have had, and the fix:** vectors cover the whole catalogue, so a naive similar-search would surface a line from a shabad only somebody else has. `allowed_line_ids()` is therefore *always* scoped to the caller's library — membership is the floor, filters only narrow it further.
+
+**Two defences against the missing `WHERE user_id`, because one is not enough:**
+
+- **`GuardedConnection`** refuses any query naming a personal table without `user_id`. A leak becomes a loud crash on the first request rather than a silent wrong answer. Deliberately a substring check, not a parser: it can be fooled on purpose but never by accident, and accident is the entire threat. `library(all_users=True)` is the greppable escape hatch for genuinely cross-account work.
+- **`tools/test_isolation.py`** signs in as two accounts on a throwaway copy and asserts neither can see the other's anything — 30 checks across every read, every write, admin gating and anonymous access. This is what catches a query that *has* `user_id` and still joins wrong.
+
+**Auth:** scrypt from the standard library (never a fast hash), session cookie rather than Basic Auth (Basic cannot log out), httponly + samesite. Login verifies against a throwaway hash even for unknown usernames, so response time does not reveal which accounts exist.
+
+**Admin is a flag, not a role system.** The control panel — spend, jobs, backups, accounts — is admin-only, because those are machine-level facts. Everything else every account gets.
+
+**Votes stay per person.** A shared tally would average my judgement of which model is better with somebody else's, and the value of §3's votes is precisely that they are *one* person's considered opinion about Gurbani.
+
+**Not built, and deliberately:** signup, email verification, password reset, rate limiting. Those are public-launch work; the admin creates accounts by hand.
 
 ---
 

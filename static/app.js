@@ -472,10 +472,17 @@ async function render(st, viaPop) {
   const y = st.scrollY;
   show(view);
 
-  // Returning to a list that is still good: put the page back BEFORE any await,
+  // Returning to a view we already have: put the page back BEFORE any await,
   // so the restored position is the first thing painted rather than a correction
   // half a second later.
-  const reuse = view === 'list' && viaPop && listLoaded;
+  //
+  // The similar page counts as reusable only for the SAME query line. Coming
+  // back from a result you opened is the same question, so the filters, the
+  // scope, the pages you loaded and where you were all stay. Tapping a
+  // different line is a new question and starts clean -- which is what
+  // "filters don't persist" was always meant to mean.
+  const reuse = (view === 'list' && viaPop && listLoaded)
+             || (view === 'similar' && viaPop && simHasQuery(st.id));
   if (reuse && y != null) window.scrollTo(0, y);
 
   if (view === 'detail') {
@@ -714,6 +721,8 @@ $('e-delete').onclick = async () => {
     $('edit-dialog').close();
     toast('Deleted');
     listLoaded = false;               // that row is gone
+    // and any similar results are now about a shabad that isn't there
+    if (typeof simState !== 'undefined') simState.shown = [];
     await loadFilters();
     go('list');                               // that row is gone; don't go back to it
   } catch (err) { toast(err.message, true); }

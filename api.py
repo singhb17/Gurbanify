@@ -12,8 +12,8 @@ Two SQLite files, deliberately separate (CLAUDE.md §5):
 Docker is NOT needed to run this; it's only needed to rebuild banidb.db.
 """
 
-import base64
 import datetime
+import hashlib
 import io
 import os
 import random
@@ -25,13 +25,16 @@ import sys
 import time
 from typing import List, Optional
 
-from fastapi import FastAPI, HTTPException, Query
-from fastapi.responses import FileResponse, HTMLResponse, JSONResponse, Response
+from fastapi import Depends, FastAPI, HTTPException, Query, Request
+from fastapi.responses import (FileResponse, HTMLResponse, JSONResponse,
+                               RedirectResponse, Response)
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
 
 HERE = os.path.dirname(os.path.abspath(__file__))
-LIBRARY_DB = os.path.join(HERE, "shabads.db")
+# SHABAD_DB lets a test point the whole app at a throwaway copy. Nothing else
+# should set it -- tools/test_isolation.py is the reason it exists.
+LIBRARY_DB = os.environ.get("SHABAD_DB") or os.path.join(HERE, "shabads.db")
 CORPUS_DB = os.path.join(HERE, "banidb.db")
 STATIC_DIR = os.path.join(HERE, "static")
 # Where a detached indexing child writes. Without this its output goes nowhere
@@ -61,37 +64,275 @@ APP_PASSWORD = os.environ.get("APP_PASSWORD", "")
 
 app = FastAPI(title="Shabad Library")
 
+# --- accounts ----------------------------------------------------------------
+#
+# Several people, one database. Libraries are private to each account; the
+# Gurbani catalogue and everything derived from it is shared, which is what
+# keeps indexing costs flat as accounts are added (CLAUDE.md §5, §16).
+
+SESSION_COOKIE = "shabad_session"
+SESSION_DAYS = 30
+# scrypt, from the standard library. Not sha256: a fast hash is exactly what an
+# attacker with the file wants, because it lets them try billions of guesses.
+# These parameters take ~100ms per attempt, which is invisible at login and
+# ruinous in bulk.
+SCRYPT_N, SCRYPT_R, SCRYPT_P = 2 ** 14, 8, 1
+
+# Paths reachable without an account.
+OPEN_PATHS = {"/health", "/login", "/api/login"}
+
+
+def hash_password(password):
+    salt = secrets.token_bytes(16)
+    key = hashlib.scrypt(password.encode("utf-8"), salt=salt,
+                         n=SCRYPT_N, r=SCRYPT_R, p=SCRYPT_P, dklen=32)
+    return f"scrypt${SCRYPT_N}${SCRYPT_R}${SCRYPT_P}${salt.hex()}${key.hex()}"
+
+
+def verify_password(password, stored):
+    """Constant-time check. Never raises on a malformed stored value."""
+    try:
+        scheme, n, r, p, salt, want = stored.split("$")
+        if scheme != "scrypt":
+            return False
+        got = hashlib.scrypt(password.encode("utf-8"), salt=bytes.fromhex(salt),
+                             n=int(n), r=int(r), p=int(p), dklen=len(want) // 2)
+        # compare_digest, not ==: a plain comparison returns as soon as two
+        # bytes differ, and how long it took leaks how much was right.
+        return secrets.compare_digest(got.hex(), want)
+    except Exception:
+        return False
+
+
+def new_session(conn, user_id):
+    token = secrets.token_urlsafe(32)
+    with conn:
+        conn.execute(
+            "INSERT INTO sessions (token, user_id, expires_at) "
+            "VALUES (?, ?, datetime('now', ?))",
+            (token, user_id, f"+{SESSION_DAYS} days"))
+    return token
+
+
+def user_for_token(conn, token):
+    if not token:
+        return None
+    row = conn.execute(
+        """SELECT u.id, u.username, u.is_admin FROM sessions s
+           JOIN users u ON u.id = s.user_id
+           WHERE s.token = ? AND s.expires_at > datetime('now')""",
+        (token,)).fetchone()
+    return dict(row) if row else None
+
 
 @app.middleware("http")
-async def require_password(request, call_next):
-    """Basic Auth over the whole app.
+async def require_login(request, call_next):
+    """Every request carries an account, or it does not get in.
 
     NOT exempt for localhost, and that is the important part: cloudflared runs
-    on this machine and proxies to http://localhost:8000, so EVERY request from
+    on this machine and proxies to http://localhost:8000, so EVERY request off
     the public tunnel arrives looking like 127.0.0.1. An exemption for local
-    addresses would therefore exempt the entire internet.
+    addresses would exempt the entire internet.
 
-    /health is the one open path. It returns a bare ok and no data, so it gives
-    an unauthenticated caller nothing, and it lets the watchdog check liveness
-    without carrying credentials around.
+    A browser asking for a page gets redirected to the login form; anything
+    under /api gets a 401 so the frontend can react rather than being handed
+    a login page where it expected json.
     """
-    if not APP_PASSWORD or request.url.path == "/health":
+    path = request.url.path
+    if path in OPEN_PATHS or path.startswith("/static/"):
         return await call_next(request)
 
-    header = request.headers.get("authorization", "")
-    if header.startswith("Basic "):
+    conn = library()
+    try:
+        user = user_for_token(conn, request.cookies.get(SESSION_COOKIE))
+    finally:
+        conn.close()
+
+    if not user:
+        if path.startswith("/api/"):
+            return JSONResponse({"detail": "not signed in"}, status_code=401)
+        return RedirectResponse("/login", status_code=303)
+
+    request.state.user = user
+    return await call_next(request)
+
+
+def current_user(request: Request):
+    """The signed-in account. The middleware guarantees one exists."""
+    user = getattr(request.state, "user", None)
+    if not user:
+        raise HTTPException(401, "not signed in")
+    return user
+
+
+def require_admin(request: Request):
+    user = current_user(request)
+    if not user["is_admin"]:
+        raise HTTPException(403, "admin only")
+    return user
+
+
+class Credentials(BaseModel):
+    username: str
+    password: str
+
+
+@app.post("/api/login")
+def login(body: Credentials, response: Response):
+    conn = library(write=True, all_users=True)      # accounts are not user-scoped
+    try:
+        row = conn.execute(
+            "SELECT id, username, password_hash, is_admin FROM users WHERE username = ?",
+            (body.username.strip(),)).fetchone()
+        # Verify even when the user does not exist, against a throwaway hash.
+        # Returning instantly for an unknown name tells an attacker which names
+        # are real, which is half of a password-guessing problem solved for free.
+        stored = row["password_hash"] if row else hash_password("nobody")
+        if not verify_password(body.password, stored) or not row:
+            raise HTTPException(401, "Wrong username or password")
+        token = new_session(conn, row["id"])
+    finally:
+        conn.close()
+
+    response.set_cookie(
+        SESSION_COOKIE, token,
+        max_age=SESSION_DAYS * 86400,
+        httponly=True,       # javascript cannot read it, so an xss cannot steal it
+        samesite="lax",      # not sent on cross-site posts
+        secure=False,        # the tunnel terminates tls; the hop here is plain http
+    )
+    return {"username": row["username"], "is_admin": bool(row["is_admin"])}
+
+
+@app.post("/api/logout")
+def logout(request: Request, response: Response):
+    token = request.cookies.get(SESSION_COOKIE)
+    if token:
+        conn = library(write=True, all_users=True)
         try:
-            user, _, pw = base64.b64decode(header[6:]).decode("utf-8").partition(":")
-            # compare_digest, not ==: a plain comparison returns as soon as two
-            # characters differ, and the time it takes leaks how much of the
-            # password was right.
-            if (secrets.compare_digest(user, APP_USER)
-                    and secrets.compare_digest(pw, APP_PASSWORD)):
-                return await call_next(request)
-        except Exception:
-            pass                        # malformed header -- treat as no header
-    return Response(status_code=401, content="Authentication required",
-                    headers={"WWW-Authenticate": 'Basic realm="Shabad Library"'})
+            with conn:
+                conn.execute("DELETE FROM sessions WHERE token = ?", (token,))
+        finally:
+            conn.close()
+    response.delete_cookie(SESSION_COOKIE)
+    return {"ok": True}
+
+
+@app.get("/api/me")
+def whoami(user=Depends(current_user)):
+    return user
+
+
+@app.get("/login")
+def login_page():
+    return FileResponse(os.path.join(STATIC_DIR, "login.html"))
+
+
+# --- accounts, for the admin -------------------------------------------------
+#
+# Lives on the control panel, which is admin-only for the same reason: spend,
+# jobs, backups and other people's accounts are all machine-level facts that
+# an ordinary account has no business seeing.
+
+class NewUser(BaseModel):
+    username: str
+    password: str
+    is_admin: bool = False
+
+
+class PasswordReset(BaseModel):
+    password: str
+
+
+MIN_PASSWORD = 8
+
+
+@app.get("/api/admin/users")
+def list_users(user=Depends(require_admin)):
+    conn = library(all_users=True)
+    try:
+        rows = [dict(r) for r in conn.execute(
+            """SELECT u.id, u.username, u.is_admin, u.created_at,
+                      (SELECT COUNT(*) FROM user_shabads us WHERE us.user_id = u.id)
+                        AS shabads,
+                      (SELECT COUNT(*) FROM sessions s
+                        WHERE s.user_id = u.id AND s.expires_at > datetime('now'))
+                        AS sessions
+               FROM users u ORDER BY u.id""")]
+    finally:
+        conn.close()
+    return {"users": rows, "me": user["id"]}
+
+
+@app.post("/api/admin/users")
+def create_user(body: NewUser, user=Depends(require_admin)):
+    name = body.username.strip()
+    if not name:
+        raise HTTPException(400, "username required")
+    if len(body.password) < MIN_PASSWORD:
+        raise HTTPException(400, f"password must be at least {MIN_PASSWORD} characters")
+    conn = library(write=True, all_users=True)
+    try:
+        with conn:
+            cur = conn.execute(
+                "INSERT INTO users (username, password_hash, is_admin) VALUES (?,?,?)",
+                (name, hash_password(body.password), 1 if body.is_admin else 0))
+        new_id = cur.lastrowid
+    except sqlite3.IntegrityError:
+        raise HTTPException(409, "that username is taken")
+    finally:
+        conn.close()
+    # A new account starts empty. It shares the catalogue, so anything it adds
+    # that somebody already has costs nothing and is searchable at once.
+    return {"id": new_id, "username": name, "is_admin": body.is_admin}
+
+
+@app.post("/api/admin/users/{user_id}/password")
+def reset_password(user_id: int, body: PasswordReset, user=Depends(require_admin)):
+    if len(body.password) < MIN_PASSWORD:
+        raise HTTPException(400, f"password must be at least {MIN_PASSWORD} characters")
+    conn = library(write=True, all_users=True)
+    try:
+        with conn:
+            cur = conn.execute("UPDATE users SET password_hash = ? WHERE id = ?",
+                               (hash_password(body.password), user_id))
+            # Every existing session for that account dies with the old password.
+            # A reset that left them signed in would not actually lock anyone out.
+            conn.execute("DELETE FROM sessions WHERE user_id = ?", (user_id,))
+        if not cur.rowcount:
+            raise HTTPException(404, "no such account")
+    finally:
+        conn.close()
+    return {"id": user_id, "password_changed": True}
+
+
+@app.delete("/api/admin/users/{user_id}")
+def delete_user(user_id: int, user=Depends(require_admin)):
+    """Delete an account AND everything it owns. Irreversible.
+
+    The catalogue is left alone: its shabads, lines and vectors may be in
+    somebody else's library, and even if not, the derived layer cost money.
+    """
+    if user_id == user["id"]:
+        raise HTTPException(400, "you cannot delete the account you are signed in to")
+    conn = library(write=True, all_users=True)
+    try:
+        row = conn.execute("SELECT username FROM users WHERE id = ?",
+                           (user_id,)).fetchone()
+        if not row:
+            raise HTTPException(404, "no such account")
+        if conn.execute("SELECT COUNT(*) FROM users WHERE is_admin = 1").fetchone()[0] == 1 \
+                and conn.execute("SELECT is_admin FROM users WHERE id = ?",
+                                 (user_id,)).fetchone()[0]:
+            raise HTTPException(400, "that is the only admin account")
+        with conn:
+            for t in ("user_shabads", "tags", "shortlist", "history", "learning",
+                      "line_relations", "sessions"):
+                conn.execute(f"DELETE FROM {t} WHERE user_id = ?", (user_id,))
+            conn.execute("DELETE FROM users WHERE id = ?", (user_id,))
+    finally:
+        conn.close()
+    return {"deleted": user_id, "username": row["username"]}
 
 
 @app.get("/health")
@@ -140,6 +381,34 @@ SIMILAR_LIMIT = 20          # §3: about twenty results, ranked, never threshold
 
 
 @app.on_event("startup")
+def require_migrated_database():
+    """Refuse to start on a single-user database.
+
+    The multi-account split moves columns between tables, so a half-migrated
+    database is not something to paper over at runtime: the app would run,
+    queries would return nothing, and it would look like the library had been
+    lost. Better to stop with the command that fixes it.
+    """
+    if not os.path.exists(LIBRARY_DB):
+        return
+    conn = sqlite3.connect(LIBRARY_DB)
+    try:
+        have = {r[0] for r in conn.execute(
+            "SELECT name FROM sqlite_master WHERE type='table'")}
+        missing = {"users", "sessions", "user_shabads"} - have
+    finally:
+        conn.close()
+    if missing:
+        sys.exit(
+            "\n  This database has not been migrated for multiple accounts.\n"
+            f"  Missing: {', '.join(sorted(missing))}\n\n"
+            "  Back up, then run:\n"
+            "      python tools/backup.py\n"
+            "      python tools/migrate_multiuser.py            (shows the plan)\n"
+            "      python tools/migrate_multiuser.py --write\n")
+
+
+@app.on_event("startup")
 def ensure_deck_schema():
     """Bring an existing database up to date: deck storage, and the open history.
 
@@ -153,54 +422,44 @@ def ensure_deck_schema():
     conn = sqlite3.connect(LIBRARY_DB)
     try:
         with conn:
-            have = {r[1] for r in conn.execute("PRAGMA table_info(shabads)")}
-            if "last_surfaced" not in have:
-                conn.execute("ALTER TABLE shabads ADD COLUMN last_surfaced TEXT")
-                print("migrated: added shabads.last_surfaced")
+            # The personal tables. All carry user_id since the multi-account
+            # split -- these definitions are for a FRESH database; an existing
+            # one is restructured by tools/migrate_multiuser.py, which
+            # require_migrated_database() insists on having been run.
             conn.execute("""
                 CREATE TABLE IF NOT EXISTS shortlist (
+                  user_id    INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
                   shabad_id  INTEGER NOT NULL REFERENCES shabads(id) ON DELETE CASCADE,
                   list       TEXT NOT NULL DEFAULT 'Interested',
                   added_at   TEXT NOT NULL DEFAULT (datetime('now')),
-                  PRIMARY KEY (shabad_id, list)
+                  PRIMARY KEY (user_id, shabad_id, list)
                 )""")
             conn.execute("""
                 CREATE TABLE IF NOT EXISTS history (
                   id         INTEGER PRIMARY KEY,
+                  user_id    INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
                   shabad_id  INTEGER NOT NULL REFERENCES shabads(id) ON DELETE CASCADE,
                   opened_at  TEXT NOT NULL DEFAULT (datetime('now'))
                 )""")
             conn.execute("""
                 CREATE TABLE IF NOT EXISTS learning (
-                  shabad_id      INTEGER PRIMARY KEY REFERENCES shabads(id) ON DELETE CASCADE,
+                  user_id        INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+                  shabad_id      INTEGER NOT NULL REFERENCES shabads(id) ON DELETE CASCADE,
                   added_at       TEXT NOT NULL DEFAULT (datetime('now')),
                   status         TEXT NOT NULL DEFAULT 'not_started',
-                  last_practised TEXT
+                  last_practised TEXT,
+                  PRIMARY KEY (user_id, shabad_id)
                 )""")
             # The SM-2 layer that used to live here -- per-line ease, six levels,
             # due dates, a rahao gate, daily caps -- is gone. It worked and went
             # unused: being told what to practise and when turns something you
             # want to do into something you are behind on. Dropped rather than
             # tuned. See the memorization section below.
-            have = {r[1] for r in conn.execute("PRAGMA table_info(learning)")}
-            if "last_practised" not in have:
-                conn.execute("ALTER TABLE learning ADD COLUMN last_practised TEXT")
-                print("migrated: added learning.last_practised")
-            if "status" not in have:
-                conn.execute("ALTER TABLE learning ADD COLUMN status TEXT "
-                             "NOT NULL DEFAULT 'not_started'")
-                print("migrated: added learning.status")
-            if "rahao_ok" in have:
-                # Left behind by the meaning gate. Harmless, but a dead column
-                # invites someone to wonder later whether it still means anything.
-                try:
-                    conn.execute("ALTER TABLE learning DROP COLUMN rahao_ok")
-                    print("migrated: dropped learning.rahao_ok")
-                except sqlite3.OperationalError:
-                    pass                      # sqlite too old for DROP COLUMN
             conn.execute("DROP TABLE IF EXISTS learning_lines")
             conn.execute("DROP INDEX IF EXISTS idx_learning_due")
             conn.execute("DROP INDEX IF EXISTS idx_learning_shabad")
+            conn.execute("CREATE INDEX IF NOT EXISTS idx_history_user "
+                         "ON history(user_id)")
 
             # --- similarity search + model comparison (CLAUDE.md §3) ---
             conn.execute("""
@@ -222,11 +481,12 @@ def ensure_deck_schema():
                 ) WITHOUT ROWID""")
             conn.execute("""
                 CREATE TABLE IF NOT EXISTS line_relations (
+                  user_id         INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
                   query_line_id   INTEGER NOT NULL REFERENCES lines(id) ON DELETE CASCADE,
                   result_line_id  INTEGER NOT NULL REFERENCES lines(id) ON DELETE CASCADE,
                   verdict         INTEGER NOT NULL,
                   judged_at       TEXT NOT NULL DEFAULT (datetime('now')),
-                  PRIMARY KEY (query_line_id, result_line_id)
+                  PRIMARY KEY (user_id, query_line_id, result_line_id)
                 )""")
             conn.execute("""
                 CREATE TABLE IF NOT EXISTS model_results (
@@ -304,9 +564,79 @@ def heal_missing_first_letters():
 
 # --- db helpers -------------------------------------------------------------
 
-def library(write=False):
+# Tables where every row belongs to exactly one account. A query that touches
+# one of these without mentioning user_id would return -- or overwrite --
+# somebody else's library.
+USER_TABLES = ("user_shabads", "tags", "shortlist", "history", "learning",
+               "line_relations")
+
+_USER_TABLE_RE = re.compile(r"\b(" + "|".join(USER_TABLES) + r")\b", re.I)
+_STRINGS_RE = re.compile(r"'[^']*'|\"[^\"]*\"")
+_DDL_RE = re.compile(r"^\s*(create|alter|drop|pragma|begin|commit|rollback|vacuum|"
+                     r"analyze|reindex|attach|detach)\b", re.I)
+
+
+class GuardedConnection(sqlite3.Connection):
+    """A connection that refuses to touch a user's data without saying whose.
+
+    THE PROBLEM THIS SOLVES. There are two dozen endpoints reading personal
+    tables. One forgotten `AND user_id = ?` shows one account another's
+    library, and nothing about it looks wrong -- the query runs, rows come
+    back, the page renders. It is the kind of bug that is found by a user, not
+    by a developer.
+
+    So rather than trusting every query site to remember, the connection itself
+    checks: if the SQL names a table from USER_TABLES and does not mention
+    user_id anywhere, it raises instead of running. A leak becomes a loud crash
+    on the first request in development, which is the cheapest possible place
+    to find it.
+
+    Deliberately crude. It is a substring check, not a SQL parser, so it can be
+    fooled -- but it cannot be fooled by ACCIDENT, and accident is the whole
+    threat model here. Schema statements are exempt (they define these tables),
+    and the handful of legitimately cross-account queries go through
+    library(all_users=True), which is greppable in a way that a forgotten
+    clause is not.
+
+    The second half of the defence is tools/test_isolation.py, which signs in as
+    two accounts and asserts that neither can see the other's anything.
+    """
+
+    def _check(self, sql):
+        if _DDL_RE.match(sql):
+            return
+        # strip literals first: a table name inside a string is not a table
+        bare = _STRINGS_RE.sub("''", sql)
+        if _USER_TABLE_RE.search(bare) and "user_id" not in bare.lower():
+            table = _USER_TABLE_RE.search(bare).group(1)
+            raise RuntimeError(
+                f"query touches {table} without user_id -- this would read or "
+                f"write another account's library. Add the clause, or use "
+                f"library(all_users=True) if it is genuinely cross-account.\n"
+                f"  {' '.join(sql.split())[:300]}")
+
+    def execute(self, sql, parameters=(), /):
+        self._check(sql)
+        return super().execute(sql, parameters)
+
+    def executemany(self, sql, parameters, /):
+        self._check(sql)
+        return super().executemany(sql, parameters)
+
+    def executescript(self, sql, /):
+        return super().executescript(sql)          # schema only
+
+
+def library(write=False, all_users=False):
+    """A connection to the library.
+
+    `all_users=True` opts out of the guard above. Only for genuinely
+    cross-account work -- the control panel's totals, backups, admin screens --
+    and every use of it should be obvious from the surrounding code.
+    """
     conn = sqlite3.connect(LIBRARY_DB if write else f"file:{LIBRARY_DB}?mode=ro",
-                           uri=not write)
+                           uri=not write,
+                           factory=sqlite3.Connection if all_users else GuardedConnection)
     conn.row_factory = sqlite3.Row
     conn.execute("PRAGMA foreign_keys = ON")
     return conn
@@ -705,7 +1035,7 @@ def recent_jobs(conn, limit=5):
 
 
 @app.get("/api/status")
-def get_status():
+def get_status(user=Depends(require_admin)):
     """One call, everything the control panel shows.
 
     Deliberately a single endpoint rather than six. The page is a snapshot of
@@ -716,7 +1046,9 @@ def get_status():
     Read-only throughout. Nothing here starts, stops, or repairs anything --
     diagnosing and acting are separate, so that opening this page is always safe.
     """
-    conn = library()
+    # all_users: these are totals for the machine, not for one library, which
+    # is exactly why the page is admin-only.
+    conn = library(all_users=True)
     try:
         models, ver = model_coverage(conn)
         jobs = recent_jobs(conn, 12)
@@ -734,6 +1066,7 @@ def get_status():
                 ("history",   "SELECT COUNT(*) FROM history"),
                 ("learning",  "SELECT COUNT(*) FROM learning"),
                 ("votes",     "SELECT COUNT(*) FROM line_relations"),
+                ("accounts",  "SELECT COUNT(*) FROM users"),
                 ("user_added", "SELECT COUNT(*) FROM shabads WHERE is_user_added = 1"),
                 ("no_teeka",  "SELECT COUNT(*) FROM lines WHERE teeka_pa IS NULL OR teeka_pa = ''"),
                 ("no_english", "SELECT COUNT(*) FROM lines WHERE translation_en IS NULL OR translation_en = ''"),
@@ -767,7 +1100,7 @@ def get_status():
 
 
 @app.post("/api/backup")
-def run_backup():
+def run_backup(user=Depends(require_admin)):
     """Run tools/backup.py and hand back exactly what it printed.
 
     The one action allowed on an otherwise read-only page, because it is the one
@@ -972,26 +1305,31 @@ LENGTH_BY_ID = {b[0]: b for b in LENGTH_BANDS}
 LINE_COUNT_SQL = "(SELECT COUNT(*) FROM lines l2 WHERE l2.shabad_id = s.id)"
 
 
-def filter_clauses(status, rarity, genre, speed, raag, writer, length=None):
+def filter_clauses(uid, status, rarity, genre, speed, raag, writer, length=None):
     """The tag/metadata WHERE clauses shared by the library list and the deck.
 
     Shared so the deck can never disagree with the library about what "Status:
     Heard" means. Returns (list_of_conditions, args) to be ANDed by the caller.
+
+    `uid` leads the signature so it cannot be forgotten by drifting off the end
+    of the argument list. Callers are expected to have already joined
+    user_shabads as `us`; status and rarity live there now, not on the shabad.
     """
     where, args = [], []
-    for col, vals in (("s.status", status), ("s.rarity", rarity),
+    for col, vals in (("us.status", status), ("us.rarity", rarity),
                       ("s.raag_en", raag), ("s.writer", writer)):
         if vals:
             where.append(f"{col} IN ({','.join('?' * len(vals))})")
             args += vals
 
     # tags are rows, not columns -- a shabad matches if it has ANY of the
-    # requested values for that kind
+    # requested values for that kind, and only MY rows count
     for kind, vals in (("genre", genre), ("speed", speed)):
         if vals:
             where.append(f"""EXISTS(SELECT 1 FROM tags t WHERE t.shabad_id = s.id
-                             AND t.kind = ? AND t.value IN ({','.join('?' * len(vals))}))""")
-            args += [kind] + vals
+                             AND t.user_id = ? AND t.kind = ?
+                             AND t.value IN ({','.join('?' * len(vals))}))""")
+            args += [uid, kind] + vals
 
     # Bands are OR'd with each other and AND'd with everything else: picking
     # Short and Long means either of those, not neither.
@@ -1005,11 +1343,14 @@ def filter_clauses(status, rarity, genre, speed, raag, writer, length=None):
     return where, args
 
 
-def decorate(conn, rows):
+def decorate(conn, uid, rows):
     """Attach each shabad's tags and the English of its own line.
 
     Every list view needs both -- without source_translation the list is bare
     Gurmukhi whenever you aren't searching, which is most of the time.
+
+    `uid` is second, right after the connection, so a call site that forgot it
+    fails on arity rather than quietly decorating with somebody else's tags.
     """
     if not rows:
         return rows
@@ -1018,7 +1359,8 @@ def decorate(conn, rows):
 
     tags = {}
     for t in conn.execute(
-            f"SELECT shabad_id, kind, value FROM tags WHERE shabad_id IN ({ph})", ids):
+            f"""SELECT shabad_id, kind, value FROM tags
+                WHERE user_id = ? AND shabad_id IN ({ph})""", [uid, *ids]):
         tags.setdefault(t["shabad_id"], {}).setdefault(t["kind"], []).append(t["value"])
 
     trans = {
@@ -1032,7 +1374,8 @@ def decorate(conn, rows):
 
     # so any list view can show whether a shabad is already shortlisted
     shortlisted = {r[0] for r in conn.execute(
-        f"SELECT shabad_id FROM shortlist WHERE shabad_id IN ({ph})", ids)}
+        f"""SELECT shabad_id FROM shortlist
+            WHERE user_id = ? AND shabad_id IN ({ph})""", [uid, *ids])}
 
     for r in rows:
         r["tags"] = tags.get(r["id"], {})
@@ -1102,8 +1445,13 @@ def list_shabads(
     writer: Optional[List[str]] = Query(None),
     length: Optional[List[str]] = Query(None),
     sort: str = "id",
+    user=Depends(current_user),
 ):
-    where, args = [], []
+    # user_shabads is what makes this MY library rather than the catalogue: the
+    # join is the membership test, so a shabad someone else added is simply not
+    # in the result. The `us.user_id = ?` also satisfies the guard.
+    uid = user["id"]
+    where, args = ["us.user_id = ?"], [uid]
 
     if q:
         if mode == "firstletter":
@@ -1121,30 +1469,36 @@ def list_shabads(
             # land in one line, or all of them in the notes. Half in each is not
             # a match -- see keywords_clause.
             line_sql, line_args = keywords_clause("l.translation_en", q)
-            note_sql, note_args = keywords_clause("s.notes", q)
+            note_sql, note_args = keywords_clause("us.notes", q)
             if line_sql:
                 where.append(f"""(({note_sql}) OR EXISTS(
                                    SELECT 1 FROM lines l WHERE l.shabad_id = s.id
                                    AND ({line_sql})))""")
                 args += note_args + line_args
 
-    fwhere, fargs = filter_clauses(status, rarity, genre, speed, raag, writer, length)
+    fwhere, fargs = filter_clauses(uid, status, rarity, genre, speed, raag, writer,
+                                   length)
     where += fwhere
     args += fargs
 
     order = {
         "id": "s.id", "ang": "s.ang", "raag": "s.raag_en",
-        "writer": "s.writer", "status": "s.status", "rarity": "s.rarity",
+        "writer": "s.writer", "status": "us.status", "rarity": "us.rarity",
         "line": "s.source_line",
     }.get(sort, "s.id")
 
-    sql = f"""SELECT s.*, (SELECT COUNT(*) FROM lines l WHERE l.shabad_id = s.id) line_count
+    # us.* after s.* so status/rarity/notes land on the row where they used to
+    # live -- everything downstream still sees one flat shabad.
+    sql = f"""SELECT s.*, us.rarity, us.status, us.notes, us.last_surfaced,
+                     us.added_at,
+                     (SELECT COUNT(*) FROM lines l WHERE l.shabad_id = s.id) line_count
               FROM shabads s
-              {'WHERE ' + ' AND '.join(where) if where else ''}
+              JOIN user_shabads us ON us.shabad_id = s.id
+              WHERE {' AND '.join(where)}
               ORDER BY {order}"""
 
     conn = library()
-    rows = decorate(conn, [dict(r) for r in conn.execute(sql, args)])
+    rows = decorate(conn, uid, [dict(r) for r in conn.execute(sql, args)])
 
     # Show WHY each shabad matched. Without this a hit on an inner line looks
     # like a false positive, because the card shows source_line -- a different
@@ -1180,23 +1534,33 @@ def list_shabads(
 
 
 @app.get("/api/shabads/{shabad_id}")
-def get_shabad(shabad_id: int):
+def get_shabad(shabad_id: int, user=Depends(current_user)):
+    uid = user["id"]
     conn = library()
-    row = conn.execute("SELECT * FROM shabads WHERE id = ?", (shabad_id,)).fetchone()
+    # The join is the permission check. A shabad in the catalogue that I have
+    # not added is a 404 for me -- not a 403, which would confirm it exists and
+    # tell me something about somebody else's library.
+    row = conn.execute(
+        """SELECT s.*, us.rarity, us.status, us.notes, us.last_surfaced, us.added_at
+           FROM shabads s JOIN user_shabads us ON us.shabad_id = s.id
+           WHERE s.id = ? AND us.user_id = ?""", (shabad_id, uid)).fetchone()
     if not row:
         conn.close()
         raise HTTPException(404, "no such shabad")
     lines = [dict(r) for r in conn.execute(
         "SELECT * FROM lines WHERE shabad_id = ? ORDER BY line_no", (shabad_id,))]
     tags = {}
-    for t in conn.execute("SELECT kind, value FROM tags WHERE shabad_id = ?", (shabad_id,)):
+    for t in conn.execute(
+            "SELECT kind, value FROM tags WHERE user_id = ? AND shabad_id = ?",
+            (uid, shabad_id)):
         tags.setdefault(t["kind"], []).append(t["value"])
     # the detail view has its own heart, so it needs this too -- without it the
     # heart reads as empty on a shabad that IS shortlisted
     shortlisted = conn.execute(
-        "SELECT 1 FROM shortlist WHERE shabad_id = ?", (shabad_id,)).fetchone() is not None
-    lrn = conn.execute("SELECT 1 FROM learning WHERE shabad_id = ?",
-                       (shabad_id,)).fetchone() is not None
+        "SELECT 1 FROM shortlist WHERE user_id = ? AND shabad_id = ?",
+        (uid, shabad_id)).fetchone() is not None
+    lrn = conn.execute("SELECT 1 FROM learning WHERE user_id = ? AND shabad_id = ?",
+                       (uid, shabad_id)).fetchone() is not None
     # How far the derived layer (CLAUDE.md §5) has got for this shabad. Reads
     # zero for everything until the summary/embedding pipeline exists, which is
     # exactly what makes it a useful progress indicator for that work.
@@ -1212,17 +1576,43 @@ def get_shabad(shabad_id: int):
 
 
 @app.post("/api/shabads")
-def add_shabad(body: ShabadCreate):
+def add_shabad(body: ShabadCreate, user=Depends(current_user)):
+    """Add a shabad to MY library.
+
+    Two quite different jobs, and telling them apart is the point of the shared
+    catalogue: if this shabad is already in `shabads` -- because I had it once,
+    or because somebody else added it -- then its lines, summaries and vectors
+    already exist. Joining my library to it is one INSERT, costs nothing, and it
+    is searchable immediately. Only a shabad nobody has yet needs fetching from
+    BaniDB and indexing.
+    """
+    uid = user["id"]
     conn = library(write=True)
-    existing = conn.execute("SELECT id, source_line FROM shabads WHERE banidb_shabad_id = ?",
-                            (body.banidb_shabad_id,)).fetchone()
-    if existing:
-        conn.close()
-        # not an error worth shouting about -- tell the UI which one it already is
-        raise HTTPException(409, {
-            "message": "already in your library",
-            "id": existing["id"], "source_line": existing["source_line"],
-        })
+    known = conn.execute("SELECT id, source_line FROM shabads WHERE banidb_shabad_id = ?",
+                         (body.banidb_shabad_id,)).fetchone()
+
+    if known:
+        mine = conn.execute(
+            "SELECT 1 FROM user_shabads WHERE user_id = ? AND shabad_id = ?",
+            (uid, known["id"])).fetchone()
+        if mine:
+            conn.close()
+            # not an error worth shouting about -- tell the UI which one it is
+            raise HTTPException(409, {
+                "message": "already in your library",
+                "id": known["id"], "source_line": known["source_line"],
+            })
+        try:
+            with conn:
+                add_to_my_library(conn, uid, known["id"], body)
+            n = conn.execute("SELECT COUNT(*) FROM lines WHERE shabad_id = ?",
+                             (known["id"],)).fetchone()[0]
+        finally:
+            conn.close()
+        # No indexing: the derived layer for these lines already exists, which
+        # is the entire reason the catalogue is shared.
+        return {"id": known["id"], "lines": n, "indexing_started": False,
+                "reused": True}
 
     cor = corpus()
     verses = cor.execute(
@@ -1243,14 +1633,13 @@ def add_shabad(body: ShabadCreate):
             cur = conn.execute(
                 """INSERT INTO shabads
                      (banidb_shabad_id, source_line, source_line_no, ang, raag_en,
-                      raag_pa, writer, source_en, source_pa, rarity, status, notes,
+                      raag_pa, writer, source_en, source_pa,
                       is_user_added, imported_at)
-                   VALUES (?,?,?,?,?,?,?,?,?,?,?,?,0,datetime('now'))""",
+                   VALUES (?,?,?,?,?,?,?,?,?,0,datetime('now'))""",
                 (body.banidb_shabad_id, mine["gurmukhi"], body.source_line_no,
                  first(verses, "ang"), first(verses, "raag_en"), first(verses, "raag_pa"),
                  first(verses, "writer"), first(verses, "source_en"),
-                 first(verses, "source_pa"),
-                 body.rarity or None, body.status or None, body.notes or None))
+                 first(verses, "source_pa")))
             new_id = cur.lastrowid
 
             # first_letters is what "First Letter Gurbani" searches. Leaving it
@@ -1265,24 +1654,40 @@ def add_shabad(body: ShabadCreate):
                   v["transliteration"], v["english"], v["teeka"], v["first_letters"])
                  for v in verses])
 
-            conn.executemany(
-                "INSERT OR IGNORE INTO tags (shabad_id, kind, value) VALUES (?,?,?)",
-                [(new_id, kind, val)
-                 for kind, vals in (("genre", body.genre), ("speed", body.speed))
-                 for val in (vals or ["Not chosen"])])
+            add_to_my_library(conn, uid, new_id, body)
         auto = get_setting(conn, "auto_index") == "1"
     finally:
         conn.close()
     # after the connection is closed, so the child never contends for the write
     if auto:
         spawn_indexer()
-    return {"id": new_id, "lines": len(verses), "indexing_started": auto}
+    return {"id": new_id, "lines": len(verses), "indexing_started": auto,
+            "reused": False}
+
+
+def add_to_my_library(conn, uid, shabad_id, body):
+    """The personal half of adding a shabad: membership, metadata, tags."""
+    conn.execute(
+        """INSERT INTO user_shabads
+             (user_id, shabad_id, rarity, status, notes, source_line_no)
+           VALUES (?,?,?,?,?,?)""",
+        (uid, shabad_id, body.rarity or None, body.status or None,
+         body.notes or None, body.source_line_no))
+    conn.executemany(
+        "INSERT OR IGNORE INTO tags (user_id, shabad_id, kind, value) VALUES (?,?,?,?)",
+        [(uid, shabad_id, kind, val)
+         for kind, vals in (("genre", body.genre), ("speed", body.speed))
+         for val in (vals or ["Not chosen"])])
 
 
 @app.patch("/api/shabads/{shabad_id}")
-def update_shabad(shabad_id: int, body: ShabadUpdate):
+def update_shabad(shabad_id: int, body: ShabadUpdate, user=Depends(current_user)):
+    """Edit MY metadata. The catalogue entry itself is never touched -- raw text
+    is not mine to change (CLAUDE.md §5), and it is shared besides."""
+    uid = user["id"]
     conn = library(write=True)
-    if not conn.execute("SELECT 1 FROM shabads WHERE id = ?", (shabad_id,)).fetchone():
+    if not conn.execute("SELECT 1 FROM user_shabads WHERE user_id = ? AND shabad_id = ?",
+                        (uid, shabad_id)).fetchone():
         conn.close()
         raise HTTPException(404, "no such shabad")
 
@@ -1292,27 +1697,44 @@ def update_shabad(shabad_id: int, body: ShabadUpdate):
         with conn:
             if fields:
                 conn.execute(
-                    f"UPDATE shabads SET {','.join(f'{k}=?' for k in fields)} WHERE id=?",
-                    [*fields.values(), shabad_id])
+                    f"""UPDATE user_shabads SET {','.join(f'{k}=?' for k in fields)}
+                        WHERE user_id=? AND shabad_id=?""",
+                    [*fields.values(), uid, shabad_id])
             # tags are replaced wholesale per kind, not merged
             for kind, vals in (("genre", body.genre), ("speed", body.speed)):
                 if vals is None:
                     continue
-                conn.execute("DELETE FROM tags WHERE shabad_id=? AND kind=?", (shabad_id, kind))
+                conn.execute("DELETE FROM tags WHERE user_id=? AND shabad_id=? AND kind=?",
+                             (uid, shabad_id, kind))
                 conn.executemany(
-                    "INSERT OR IGNORE INTO tags (shabad_id, kind, value) VALUES (?,?,?)",
-                    [(shabad_id, kind, v) for v in (vals or ["Not chosen"])])
+                    "INSERT OR IGNORE INTO tags (user_id, shabad_id, kind, value) "
+                    "VALUES (?,?,?,?)",
+                    [(uid, shabad_id, kind, v) for v in (vals or ["Not chosen"])])
     finally:
         conn.close()
-    return get_shabad(shabad_id)
+    return get_shabad(shabad_id, user)
 
 
 @app.delete("/api/shabads/{shabad_id}")
-def delete_shabad(shabad_id: int):
+def delete_shabad(shabad_id: int, user=Depends(current_user)):
+    """Remove it from MY library.
+
+    The catalogue entry, its lines and its vectors stay: somebody else may have
+    the same shabad, and even if not, the derived layer cost money to build and
+    re-adding should be free. Orphaned catalogue rows are cheap; re-indexing is
+    not.
+    """
+    uid = user["id"]
     conn = library(write=True)
     try:
         with conn:
-            cur = conn.execute("DELETE FROM shabads WHERE id = ?", (shabad_id,))
+            cur = conn.execute(
+                "DELETE FROM user_shabads WHERE user_id = ? AND shabad_id = ?",
+                (uid, shabad_id))
+            if cur.rowcount:
+                for t in ("tags", "shortlist", "history", "learning"):
+                    conn.execute(f"DELETE FROM {t} WHERE user_id = ? AND shabad_id = ?",
+                                 (uid, shabad_id))
         if not cur.rowcount:
             raise HTTPException(404, "no such shabad")
     finally:
@@ -1321,20 +1743,29 @@ def delete_shabad(shabad_id: int):
 
 
 @app.get("/api/filters")
-def filters():
-    """Every value actually present, so the filter UI never offers a dead option."""
+def filters(user=Depends(current_user)):
+    """Every value actually present IN MY LIBRARY, so the filter UI never offers
+    a dead option -- and never reveals that someone else uses a raag I don't."""
+    uid = user["id"]
     conn = library()
     out = {}
     for name, sql in (
-        ("status", "SELECT DISTINCT status FROM shabads WHERE status IS NOT NULL ORDER BY 1"),
-        ("rarity", "SELECT DISTINCT rarity FROM shabads WHERE rarity IS NOT NULL ORDER BY 1"),
-        ("raag", "SELECT DISTINCT raag_en FROM shabads WHERE raag_en IS NOT NULL ORDER BY 1"),
-        ("writer", "SELECT DISTINCT writer FROM shabads WHERE writer IS NOT NULL ORDER BY 1"),
+        ("status", """SELECT DISTINCT status FROM user_shabads
+                      WHERE user_id = ? AND status IS NOT NULL ORDER BY 1"""),
+        ("rarity", """SELECT DISTINCT rarity FROM user_shabads
+                      WHERE user_id = ? AND rarity IS NOT NULL ORDER BY 1"""),
+        ("raag", """SELECT DISTINCT s.raag_en FROM shabads s
+                    JOIN user_shabads us ON us.shabad_id = s.id
+                    WHERE us.user_id = ? AND s.raag_en IS NOT NULL ORDER BY 1"""),
+        ("writer", """SELECT DISTINCT s.writer FROM shabads s
+                      JOIN user_shabads us ON us.shabad_id = s.id
+                      WHERE us.user_id = ? AND s.writer IS NOT NULL ORDER BY 1"""),
     ):
-        out[name] = [r[0] for r in conn.execute(sql)]
+        out[name] = [r[0] for r in conn.execute(sql, (uid,))]
     for kind in TAG_KINDS:
         out[kind] = [r[0] for r in conn.execute(
-            "SELECT DISTINCT value FROM tags WHERE kind = ? ORDER BY 1", (kind,))]
+            "SELECT DISTINCT value FROM tags WHERE user_id = ? AND kind = ? ORDER BY 1",
+            (uid, kind))]
 
     # Bands come from the server with their boundaries and live counts, so the
     # UI renders whatever is defined here and the two can never disagree about
@@ -1344,11 +1775,14 @@ def filters():
         {"value": vid,
          "label": f"{label} {lo}+" if hi > 999 else f"{label} {lo}–{hi}",
          "count": conn.execute(
-             f"SELECT COUNT(*) FROM shabads s WHERE {LINE_COUNT_SQL} BETWEEN ? AND ?",
-             (lo, hi)).fetchone()[0]}
+             f"""SELECT COUNT(*) FROM shabads s
+                 JOIN user_shabads us ON us.shabad_id = s.id
+                 WHERE us.user_id = ? AND {LINE_COUNT_SQL} BETWEEN ? AND ?""",
+             (uid, lo, hi)).fetchone()[0]}
         for vid, label, lo, hi in LENGTH_BANDS]
 
-    out["total"] = conn.execute("SELECT COUNT(*) FROM shabads").fetchone()[0]
+    out["total"] = conn.execute(
+        "SELECT COUNT(*) FROM user_shabads WHERE user_id = ?", (uid,)).fetchone()[0]
     conn.close()
     return out
 
@@ -1370,8 +1804,9 @@ def deck(
     writer: Optional[List[str]] = Query(None),
     length: Optional[List[str]] = Query(None),
     include_shortlisted: bool = False,
+    user=Depends(current_user),
 ):
-    """A shuffled deck of shabads not already shortlisted.
+    """A shuffled deck of MY shabads not already shortlisted.
 
     Plain random ordering. There was recency weighting here (surface what you
     haven't seen in a while, per CLAUDE.md §3); it was removed on request as
@@ -1381,25 +1816,28 @@ def deck(
     Filters use the same clauses as the library list, so "Status: Heard" cannot
     mean two different things in two places.
     """
-    where, args = [], []
+    uid = user["id"]
+    where, args = ["us.user_id = ?"], [uid]
     if not include_shortlisted:
         where.append("""NOT EXISTS(SELECT 1 FROM shortlist sl
-                                   WHERE sl.shabad_id = s.id AND sl.list = ?)""")
-        args.append(list_name)
+                                   WHERE sl.shabad_id = s.id AND sl.user_id = ?
+                                     AND sl.list = ?)""")
+        args += [uid, list_name]
 
-    fwhere, fargs = filter_clauses(status, rarity, genre, speed, raag, writer, length)
+    fwhere, fargs = filter_clauses(uid, status, rarity, genre, speed, raag, writer,
+                                   length)
     where += fwhere
     args += fargs
 
-    clause = f"WHERE {' AND '.join(where)}" if where else ""
+    clause = f"WHERE {' AND '.join(where)}"
+    joined = f"FROM shabads s JOIN user_shabads us ON us.shabad_id = s.id {clause}"
     conn = library()
     try:
-        total = conn.execute(
-            f"SELECT COUNT(*) FROM shabads s {clause}", args).fetchone()[0]
-        rows = decorate(conn, [dict(r) for r in conn.execute(
-            f"""SELECT s.*, (SELECT COUNT(*) FROM lines l WHERE l.shabad_id = s.id) line_count
-                FROM shabads s
-                {clause}
+        total = conn.execute(f"SELECT COUNT(*) {joined}", args).fetchone()[0]
+        rows = decorate(conn, uid, [dict(r) for r in conn.execute(
+            f"""SELECT s.*, us.rarity, us.status, us.notes, us.last_surfaced,
+                       (SELECT COUNT(*) FROM lines l WHERE l.shabad_id = s.id) line_count
+                {joined}
                 ORDER BY RANDOM() LIMIT ?""", [*args, max(1, limit)])])
         attach_lines(conn, rows)
     finally:
@@ -1413,7 +1851,7 @@ class Swipe(BaseModel):
 
 
 @app.post("/api/deck/{shabad_id}/swipe")
-def swipe(shabad_id: int, body: Swipe):
+def swipe(shabad_id: int, body: Swipe, user=Depends(current_user)):
     """Record a decision, and stamp last_surfaced either way.
 
     Both directions count as surfaced: the point of the timestamp is "I have
@@ -1424,24 +1862,27 @@ def swipe(shabad_id: int, body: Swipe):
     if body.direction not in ("left", "right"):
         raise HTTPException(400, "direction must be 'left' or 'right'")
 
+    uid = user["id"]
     conn = library(write=True)
     try:
-        row = conn.execute("SELECT last_surfaced FROM shabads WHERE id = ?",
-                           (shabad_id,)).fetchone()
+        row = conn.execute(
+            "SELECT last_surfaced FROM user_shabads WHERE user_id = ? AND shabad_id = ?",
+            (uid, shabad_id)).fetchone()
         if not row:
             raise HTTPException(404, "no such shabad")
         previous = row[0]           # handed back so Undo can restore it exactly
 
         with conn:
             conn.execute(
-                "UPDATE shabads SET last_surfaced = datetime('now') WHERE id = ?",
-                (shabad_id,))
+                """UPDATE user_shabads SET last_surfaced = datetime('now')
+                   WHERE user_id = ? AND shabad_id = ?""", (uid, shabad_id))
             if body.direction == "right":
                 conn.execute(
-                    "INSERT OR IGNORE INTO shortlist (shabad_id, list) VALUES (?, ?)",
-                    (shabad_id, body.list_name))
-        total = conn.execute("SELECT COUNT(*) FROM shortlist WHERE list = ?",
-                             (body.list_name,)).fetchone()[0]
+                    "INSERT OR IGNORE INTO shortlist (user_id, shabad_id, list) "
+                    "VALUES (?,?,?)", (uid, shabad_id, body.list_name))
+        total = conn.execute(
+            "SELECT COUNT(*) FROM shortlist WHERE user_id = ? AND list = ?",
+            (uid, body.list_name)).fetchone()[0]
     finally:
         conn.close()
     return {"id": shabad_id, "direction": body.direction,
@@ -1455,7 +1896,7 @@ class UndoSwipe(BaseModel):
 
 
 @app.post("/api/deck/{shabad_id}/undo")
-def undo_swipe(shabad_id: int, body: UndoSwipe):
+def undo_swipe(shabad_id: int, body: UndoSwipe, user=Depends(current_user)):
     """Reverse a swipe completely: un-shortlist it and put last_surfaced back.
 
     Restoring the timestamp matters even though nothing reads it today. The deck
@@ -1465,84 +1906,106 @@ def undo_swipe(shabad_id: int, body: UndoSwipe):
     Removing from the shortlist is tolerant of it already being gone: you may
     have deleted it by hand from the Interested list before hitting undo.
     """
+    uid = user["id"]
     conn = library(write=True)
     try:
-        if not conn.execute("SELECT 1 FROM shabads WHERE id = ?", (shabad_id,)).fetchone():
+        if not conn.execute(
+                "SELECT 1 FROM user_shabads WHERE user_id = ? AND shabad_id = ?",
+                (uid, shabad_id)).fetchone():
             raise HTTPException(404, "no such shabad")
         with conn:
-            conn.execute("UPDATE shabads SET last_surfaced = ? WHERE id = ?",
-                         (body.previous_surfaced, shabad_id))
+            conn.execute("""UPDATE user_shabads SET last_surfaced = ?
+                            WHERE user_id = ? AND shabad_id = ?""",
+                         (body.previous_surfaced, uid, shabad_id))
             if body.direction == "right":
-                conn.execute("DELETE FROM shortlist WHERE shabad_id = ? AND list = ?",
-                             (shabad_id, body.list_name))
-        total = conn.execute("SELECT COUNT(*) FROM shortlist WHERE list = ?",
-                             (body.list_name,)).fetchone()[0]
+                conn.execute("""DELETE FROM shortlist
+                                WHERE user_id = ? AND shabad_id = ? AND list = ?""",
+                             (uid, shabad_id, body.list_name))
+        total = conn.execute(
+            "SELECT COUNT(*) FROM shortlist WHERE user_id = ? AND list = ?",
+            (uid, body.list_name)).fetchone()[0]
     finally:
         conn.close()
     return {"undone": shabad_id, "shortlist_count": total}
 
 
 @app.get("/api/shortlist")
-def get_shortlist(list_name: str = DEFAULT_LIST):
+def get_shortlist(list_name: str = DEFAULT_LIST, user=Depends(current_user)):
+    uid = user["id"]
     conn = library()
     try:
-        rows = decorate(conn, [dict(r) for r in conn.execute(
-            """SELECT s.*, sl.added_at,
+        rows = decorate(conn, uid, [dict(r) for r in conn.execute(
+            """SELECT s.*, us.rarity, us.status, us.notes, sl.added_at,
                       (SELECT COUNT(*) FROM lines l WHERE l.shabad_id = s.id) line_count
-               FROM shortlist sl JOIN shabads s ON s.id = sl.shabad_id
-               WHERE sl.list = ?
-               ORDER BY sl.added_at DESC, s.id DESC""", (list_name,))])
+               FROM shortlist sl
+               JOIN shabads s ON s.id = sl.shabad_id
+               JOIN user_shabads us
+                 ON us.shabad_id = s.id AND us.user_id = sl.user_id
+               WHERE sl.user_id = ? AND sl.list = ?
+               ORDER BY sl.added_at DESC, s.id DESC""", (uid, list_name))])
     finally:
         conn.close()
     return {"count": len(rows), "list": list_name, "shabads": rows}
 
 
 @app.post("/api/shortlist/{shabad_id}")
-def add_to_shortlist(shabad_id: int, list_name: str = DEFAULT_LIST):
+def add_to_shortlist(shabad_id: int, list_name: str = DEFAULT_LIST,
+                     user=Depends(current_user)):
     """Add straight from the library, without going through the deck.
 
     Deliberately does NOT touch last_surfaced: deciding from the list is not the
     same event as being shown a card, and conflating them would corrupt the
     recency history the deck keeps for later.
     """
+    uid = user["id"]
     conn = library(write=True)
     try:
-        if not conn.execute("SELECT 1 FROM shabads WHERE id = ?", (shabad_id,)).fetchone():
+        if not conn.execute(
+                "SELECT 1 FROM user_shabads WHERE user_id = ? AND shabad_id = ?",
+                (uid, shabad_id)).fetchone():
             raise HTTPException(404, "no such shabad")
         with conn:
-            conn.execute("INSERT OR IGNORE INTO shortlist (shabad_id, list) VALUES (?, ?)",
-                         (shabad_id, list_name))
-        total = conn.execute("SELECT COUNT(*) FROM shortlist WHERE list = ?",
-                             (list_name,)).fetchone()[0]
+            conn.execute(
+                "INSERT OR IGNORE INTO shortlist (user_id, shabad_id, list) VALUES (?,?,?)",
+                (uid, shabad_id, list_name))
+        total = conn.execute(
+            "SELECT COUNT(*) FROM shortlist WHERE user_id = ? AND list = ?",
+            (uid, list_name)).fetchone()[0]
     finally:
         conn.close()
     return {"added": shabad_id, "shortlist_count": total}
 
 
 @app.delete("/api/shortlist/{shabad_id}")
-def remove_from_shortlist(shabad_id: int, list_name: str = DEFAULT_LIST):
+def remove_from_shortlist(shabad_id: int, list_name: str = DEFAULT_LIST,
+                          user=Depends(current_user)):
+    uid = user["id"]
     conn = library(write=True)
     try:
         with conn:
-            cur = conn.execute("DELETE FROM shortlist WHERE shabad_id = ? AND list = ?",
-                               (shabad_id, list_name))
+            cur = conn.execute(
+                "DELETE FROM shortlist WHERE user_id = ? AND shabad_id = ? AND list = ?",
+                (uid, shabad_id, list_name))
         if not cur.rowcount:
             raise HTTPException(404, "not in that list")
-        total = conn.execute("SELECT COUNT(*) FROM shortlist WHERE list = ?",
-                             (list_name,)).fetchone()[0]
+        total = conn.execute(
+            "SELECT COUNT(*) FROM shortlist WHERE user_id = ? AND list = ?",
+            (uid, list_name)).fetchone()[0]
     finally:
         conn.close()
     return {"removed": shabad_id, "shortlist_count": total}
 
 
 @app.delete("/api/shortlist")
-def clear_shortlist(list_name: str = DEFAULT_LIST):
+def clear_shortlist(list_name: str = DEFAULT_LIST, user=Depends(current_user)):
     """Empty the whole folder. Only touches shortlist rows -- the shabads, their
     tags and their notes are untouched, so this is not a destructive edit."""
     conn = library(write=True)
     try:
         with conn:
-            cur = conn.execute("DELETE FROM shortlist WHERE list = ?", (list_name,))
+            cur = conn.execute(
+                "DELETE FROM shortlist WHERE user_id = ? AND list = ?",
+                (user["id"], list_name))
         removed = cur.rowcount
     finally:
         conn.close()
@@ -1559,7 +2022,7 @@ class OpenedShabad(BaseModel):
 
 
 @app.post("/api/history")
-def record_open(body: OpenedShabad):
+def record_open(body: OpenedShabad, user=Depends(current_user)):
     """Log that a shabad was opened.
 
     Repeats are deliberate -- this is a log of what I actually looked at, not a
@@ -1574,63 +2037,78 @@ def record_open(body: OpenedShabad):
     Trimmed on every insert rather than by a cleanup job: the table can never
     grow past the cap, so there's nothing to remember to run.
     """
+    uid = user["id"]
     conn = library(write=True)
     try:
-        if not conn.execute("SELECT 1 FROM shabads WHERE id = ?",
-                            (body.shabad_id,)).fetchone():
+        if not conn.execute(
+                "SELECT 1 FROM user_shabads WHERE user_id = ? AND shabad_id = ?",
+                (uid, body.shabad_id)).fetchone():
             raise HTTPException(404, "no such shabad")
         with conn:
-            conn.execute("INSERT INTO history (shabad_id) VALUES (?)", (body.shabad_id,))
-            conn.execute("""DELETE FROM history WHERE id NOT IN
-                            (SELECT id FROM history ORDER BY id DESC LIMIT ?)""",
-                         (HISTORY_LIMIT,))
-        kept = conn.execute("SELECT COUNT(*) FROM history").fetchone()[0]
+            conn.execute("INSERT INTO history (user_id, shabad_id) VALUES (?,?)",
+                         (uid, body.shabad_id))
+            # The cap is PER ACCOUNT, so the inner select is scoped too --
+            # otherwise a busy account would trim everybody else's history.
+            conn.execute("""DELETE FROM history WHERE user_id = ? AND id NOT IN
+                            (SELECT id FROM history WHERE user_id = ?
+                             ORDER BY id DESC LIMIT ?)""",
+                         (uid, uid, HISTORY_LIMIT))
+        kept = conn.execute("SELECT COUNT(*) FROM history WHERE user_id = ?",
+                            (uid,)).fetchone()[0]
     finally:
         conn.close()
     return {"recorded": body.shabad_id, "kept": kept}
 
 
 @app.delete("/api/history/{history_id}")
-def remove_history_entry(history_id: int):
+def remove_history_entry(history_id: int, user=Depends(current_user)):
     """Drop ONE entry -- the row you tapped, not every visit to that shabad.
 
     A shabad can sit in here several times over. Removing all of them from a tap
     on one row would delete things that aren't on screen, so the visible row is
     the only thing that goes.
     """
+    uid = user["id"]
     conn = library(write=True)
     try:
         with conn:
-            cur = conn.execute("DELETE FROM history WHERE id = ?", (history_id,))
+            cur = conn.execute("DELETE FROM history WHERE user_id = ? AND id = ?",
+                               (uid, history_id))
         if not cur.rowcount:
             raise HTTPException(404, "no such history entry")
-        left = conn.execute("SELECT COUNT(*) FROM history").fetchone()[0]
+        left = conn.execute("SELECT COUNT(*) FROM history WHERE user_id = ?",
+                            (uid,)).fetchone()[0]
     finally:
         conn.close()
     return {"removed": history_id, "count": left}
 
 
 @app.get("/api/history")
-def get_history(limit: int = HISTORY_LIMIT):
+def get_history(limit: int = HISTORY_LIMIT, user=Depends(current_user)):
     """Newest first. A shabad appears once per time it was opened."""
+    uid = user["id"]
     conn = library()
     try:
-        rows = decorate(conn, [dict(r) for r in conn.execute(
-            """SELECT s.*, h.opened_at, h.id AS history_id,
+        rows = decorate(conn, uid, [dict(r) for r in conn.execute(
+            """SELECT s.*, us.rarity, us.status, us.notes,
+                      h.opened_at, h.id AS history_id,
                       (SELECT COUNT(*) FROM lines l WHERE l.shabad_id = s.id) line_count
-               FROM history h JOIN shabads s ON s.id = h.shabad_id
-               ORDER BY h.id DESC LIMIT ?""", (max(1, limit),))])
+               FROM history h
+               JOIN shabads s ON s.id = h.shabad_id
+               JOIN user_shabads us ON us.shabad_id = s.id AND us.user_id = h.user_id
+               WHERE h.user_id = ?
+               ORDER BY h.id DESC LIMIT ?""", (uid, max(1, limit)))])
     finally:
         conn.close()
     return {"count": len(rows), "limit": HISTORY_LIMIT, "shabads": rows}
 
 
 @app.delete("/api/history")
-def clear_history():
+def clear_history(user=Depends(current_user)):
     conn = library(write=True)
     try:
         with conn:
-            cur = conn.execute("DELETE FROM history")
+            cur = conn.execute("DELETE FROM history WHERE user_id = ?", (user["id"],))
         removed = cur.rowcount
     finally:
         conn.close()
@@ -1664,27 +2142,33 @@ LEARN_STATES = ("not_started", "in_progress", "memorized")
 
 
 @app.get("/api/learning")
-def list_learning(status: Optional[List[str]] = Query(None)):
+def list_learning(status: Optional[List[str]] = Query(None),
+                  user=Depends(current_user)):
     """Everything being memorised. Unstarted first, then newest."""
-    where, args = [], []
+    uid = user["id"]
+    where, args = ["lg.user_id = ?"], [uid]
     if status:
         keep = [s for s in status if s in LEARN_STATES]
         if keep:
             where.append(f"lg.status IN ({','.join('?' * len(keep))})")
             args += keep
-    clause = f"WHERE {' AND '.join(where)}" if where else ""
+    clause = f"WHERE {' AND '.join(where)}"
     conn = library()
     try:
-        rows = decorate(conn, [dict(r) for r in conn.execute(
-            f"""SELECT s.*, lg.added_at, lg.last_practised, lg.status AS learn_status,
+        rows = decorate(conn, uid, [dict(r) for r in conn.execute(
+            f"""SELECT s.*, us.rarity, us.status, us.notes,
+                       lg.added_at, lg.last_practised, lg.status AS learn_status,
                        (SELECT COUNT(*) FROM lines l WHERE l.shabad_id = s.id) line_count
-                FROM learning lg JOIN shabads s ON s.id = lg.shabad_id
+                FROM learning lg
+                JOIN shabads s ON s.id = lg.shabad_id
+                JOIN user_shabads us ON us.shabad_id = s.id AND us.user_id = lg.user_id
                 {clause}
                 ORDER BY CASE lg.status WHEN 'not_started' THEN 0
                                         WHEN 'in_progress' THEN 1 ELSE 2 END,
                          lg.added_at DESC""", args)])
         counts = {s: 0 for s in LEARN_STATES}
-        for r in conn.execute("SELECT status, COUNT(*) FROM learning GROUP BY status"):
+        for r in conn.execute("SELECT status, COUNT(*) FROM learning "
+                              "WHERE user_id = ? GROUP BY status", (uid,)):
             counts[r[0]] = r[1]
     finally:
         conn.close()
@@ -1697,14 +2181,16 @@ class LearnStatus(BaseModel):
 
 
 @app.patch("/api/learning/{shabad_id}")
-def set_learn_status(shabad_id: int, body: LearnStatus):
+def set_learn_status(shabad_id: int, body: LearnStatus,
+                     user=Depends(current_user)):
     if body.status not in LEARN_STATES:
         raise HTTPException(400, f"status must be one of {', '.join(LEARN_STATES)}")
     conn = library(write=True)
     try:
         with conn:
-            cur = conn.execute("UPDATE learning SET status = ? WHERE shabad_id = ?",
-                               (body.status, shabad_id))
+            cur = conn.execute(
+                "UPDATE learning SET status = ? WHERE user_id = ? AND shabad_id = ?",
+                (body.status, user["id"], shabad_id))
         if not cur.rowcount:
             raise HTTPException(404, "not being learned")
     finally:
@@ -1713,37 +2199,44 @@ def set_learn_status(shabad_id: int, body: LearnStatus):
 
 
 @app.post("/api/learning/{shabad_id}")
-def add_to_learning(shabad_id: int):
+def add_to_learning(shabad_id: int, user=Depends(current_user)):
+    uid = user["id"]
     conn = library(write=True)
     try:
-        if not conn.execute("SELECT 1 FROM shabads WHERE id = ?", (shabad_id,)).fetchone():
+        if not conn.execute(
+                "SELECT 1 FROM user_shabads WHERE user_id = ? AND shabad_id = ?",
+                (uid, shabad_id)).fetchone():
             raise HTTPException(404, "no such shabad")
         with conn:
-            conn.execute("INSERT OR IGNORE INTO learning (shabad_id) VALUES (?)",
-                         (shabad_id,))
-        total = conn.execute("SELECT COUNT(*) FROM learning").fetchone()[0]
+            conn.execute("INSERT OR IGNORE INTO learning (user_id, shabad_id) VALUES (?,?)",
+                         (uid, shabad_id))
+        total = conn.execute("SELECT COUNT(*) FROM learning WHERE user_id = ?",
+                             (uid,)).fetchone()[0]
     finally:
         conn.close()
     return {"added": shabad_id, "learning_count": total}
 
 
 @app.delete("/api/learning/{shabad_id}")
-def remove_from_learning(shabad_id: int):
+def remove_from_learning(shabad_id: int, user=Depends(current_user)):
     """Just removes it from the list. There is no progress to lose."""
+    uid = user["id"]
     conn = library(write=True)
     try:
         with conn:
-            cur = conn.execute("DELETE FROM learning WHERE shabad_id = ?", (shabad_id,))
+            cur = conn.execute("DELETE FROM learning WHERE user_id = ? AND shabad_id = ?",
+                               (uid, shabad_id))
         if not cur.rowcount:
             raise HTTPException(404, "not being learned")
-        total = conn.execute("SELECT COUNT(*) FROM learning").fetchone()[0]
+        total = conn.execute("SELECT COUNT(*) FROM learning WHERE user_id = ?",
+                             (uid,)).fetchone()[0]
     finally:
         conn.close()
     return {"removed": shabad_id, "learning_count": total}
 
 
 @app.get("/api/learning/{shabad_id}/lines")
-def learning_lines_for(shabad_id: int):
+def learning_lines_for(shabad_id: int, user=Depends(current_user)):
     """Every line of one shabad, with what each practice mode needs.
 
     ALL lines, headers included (CLAUDE.md §3). Line 1 is usually the raag and
@@ -1753,29 +2246,34 @@ def learning_lines_for(shabad_id: int):
     """
     conn = library()
     try:
-        sh = conn.execute("SELECT * FROM shabads WHERE id = ?", (shabad_id,)).fetchone()
+        uid = user["id"]
+        sh = conn.execute(
+            """SELECT s.* FROM shabads s
+               JOIN user_shabads us ON us.shabad_id = s.id
+               WHERE s.id = ? AND us.user_id = ?""", (shabad_id, uid)).fetchone()
         if not sh:
             raise HTTPException(404, "no such shabad")
         lines = [dict(r) for r in conn.execute(
             """SELECT id, line_no, gurmukhi, transliteration_en, translation_en,
                       teeka_pa, first_letters
                FROM lines WHERE shabad_id = ? ORDER BY line_no""", (shabad_id,))]
-        learning = conn.execute("SELECT 1 FROM learning WHERE shabad_id = ?",
-                                (shabad_id,)).fetchone() is not None
+        learning = conn.execute(
+            "SELECT 1 FROM learning WHERE user_id = ? AND shabad_id = ?",
+            (uid, shabad_id)).fetchone() is not None
     finally:
         conn.close()
     return {"shabad": dict(sh), "lines": lines, "learning": learning}
 
 
 @app.post("/api/learning/{shabad_id}/practised")
-def mark_practised(shabad_id: int):
+def mark_practised(shabad_id: int, user=Depends(current_user)):
     """Stamp the last-practised date. Informational -- nothing schedules on it."""
     conn = library(write=True)
     try:
         with conn:
             cur = conn.execute(
-                "UPDATE learning SET last_practised = datetime('now') WHERE shabad_id = ?",
-                (shabad_id,))
+                """UPDATE learning SET last_practised = datetime('now')
+                   WHERE user_id = ? AND shabad_id = ?""", (user["id"], shabad_id))
         if not cur.rowcount:
             raise HTTPException(404, "not being learned")
     finally:
@@ -1784,7 +2282,7 @@ def mark_practised(shabad_id: int):
 
 
 @app.get("/api/quiz/{line_id}")
-def line_quiz(line_id: int):
+def line_quiz(line_id: int, user=Depends(current_user)):
     """Multiple choice: which English meaning belongs to this line?
 
     Distractors are real translations of other lines, never invented ones -- so
@@ -1797,7 +2295,12 @@ def line_quiz(line_id: int):
     """
     conn = library()
     try:
-        line = conn.execute("SELECT * FROM lines WHERE id = ?", (line_id,)).fetchone()
+        # The join is the permission check, as everywhere else.
+        line = conn.execute(
+            """SELECT l.* FROM lines l
+               JOIN user_shabads us ON us.shabad_id = l.shabad_id
+               WHERE l.id = ? AND us.user_id = ?""",
+            (line_id, user["id"])).fetchone()
         if not line:
             raise HTTPException(404, "no such line")
 
@@ -2037,7 +2540,7 @@ class SettingPatch(BaseModel):
 
 
 @app.get("/api/indexing")
-def get_indexing():
+def get_indexing(user=Depends(require_admin)):
     """What the indexer is doing, for the badge to poll while a run is live."""
     conn = library()
     try:
@@ -2047,7 +2550,7 @@ def get_indexing():
 
 
 @app.get("/api/settings")
-def list_settings():
+def list_settings(user=Depends(current_user)):
     conn = library()
     try:
         stored = {r["key"]: r["value"] for r in conn.execute("SELECT key, value FROM settings")}
@@ -2057,7 +2560,7 @@ def list_settings():
 
 
 @app.patch("/api/settings/{key}")
-def patch_setting(key: str, body: SettingPatch):
+def patch_setting(key: str, body: SettingPatch, user=Depends(require_admin)):
     if key not in DEFAULT_SETTINGS:
         raise HTTPException(404, f"no setting named {key}")
     conn = library(write=True)
@@ -2072,7 +2575,7 @@ def patch_setting(key: str, body: SettingPatch):
 
 
 @app.get("/api/models")
-def list_models():
+def list_models(user=Depends(current_user)):
     conn = library()
     try:
         return {"models": model_rows(conn)}
@@ -2104,7 +2607,7 @@ def request_stop():
 
 
 @app.patch("/api/models/{name}")
-def patch_model(name: str, body: ModelPatch):
+def patch_model(name: str, body: ModelPatch, user=Depends(require_admin)):
     """Switching a model off also stops any run indexing it.
 
     These were separate actions and should not have been. Switching off already
@@ -2133,7 +2636,7 @@ def patch_model(name: str, body: ModelPatch):
 
 
 @app.get("/api/models/{name}/estimate")
-def model_estimate(name: str):
+def model_estimate(name: str, user=Depends(require_admin)):
     """Priced before the switch is flipped, not after.
 
     Switching a model on is the one action in this app that spends real money,
@@ -2149,7 +2652,7 @@ def model_estimate(name: str):
 
 
 @app.post("/api/models/{name}/index")
-def index_model(name: str, body: IndexRequest):
+def index_model(name: str, body: IndexRequest, user=Depends(require_admin)):
     """Start a catch-up run for one model.
 
     The ceiling is the estimate the user just approved plus 10%. The margin
@@ -2184,20 +2687,54 @@ def models_enabled(conn):
     return [m for m in model_rows(conn) if m["enabled"]]
 
 
-def allowed_line_ids(conn, status, rarity, genre, speed, raag, writer, length):
-    """Line ids whose shabad passes the filters, or None if none are set.
+SCOPES = ("mine", "all")
 
-    Built with filter_clauses, the same function the library list and the deck
-    use, so a filter cannot mean one thing on one screen and something else on
-    another. None rather than "every id" on purpose: it lets the caller skip
-    building a 5,530-element mask in the common case where nothing is filtered.
+
+def allowed_line_ids(conn, uid, scope, status, rarity, genre, speed, raag,
+                     writer, length):
+    """Line ids this search may return.
+
+    TWO SCOPES, and the difference is deliberate rather than a loosening of
+    §16's isolation:
+
+      mine  only shabads in my own library. The default, and the only scope
+            that can see my status, rarity, notes or tags.
+
+      all   every indexed line in the shared catalogue. This exposes GURBANI --
+            gurmukhi, translations, teeka, ang, raag, writer -- all of which
+            came from BaniDB and belongs to nobody. It exposes no personal
+            metadata whatever: the result query never touches user_shabads or
+            tags, so there is nothing of anyone's opinion in it.
+
+            What it does imply, and this is worth being honest about: with a
+            handful of accounts, a shabad you did not add was added by one of
+            the others. That is the point rather than a leak -- it is how a new
+            account gets something to explore on day one, and how anyone finds
+            shabads they did not know.
+
+    Personal filters (status, rarity, genre, speed) are MINE, so they cannot
+    mean anything for a shabad I do not have; under `all` they are ignored and
+    the UI hides them. Catalogue filters (raag, writer, length) apply in both.
     """
-    where, args = filter_clauses(status, rarity, genre, speed, raag, writer, length)
-    if not where:
-        return None
+    if scope == "all":
+        where, args = filter_clauses(uid, None, None, None, None, raag, writer,
+                                     length)
+        joins = ""
+    else:
+        where, args = filter_clauses(uid, status, rarity, genre, speed, raag,
+                                     writer, length)
+        where = ["us.user_id = ?"] + where
+        args = [uid] + args
+        joins = "JOIN user_shabads us ON us.shabad_id = s.id"
+
+    # `all` with no filters still has to exclude unindexed lines; the caller
+    # intersects with the vector set anyway, so an empty WHERE is fine here.
+    clause = f"WHERE {' AND '.join(where)}" if where else ""
     return {r[0] for r in conn.execute(
-        f"""SELECT l.id FROM lines l JOIN shabads s ON s.id = l.shabad_id
-            WHERE {' AND '.join(where)}""", args)}
+        f"""SELECT l.id FROM lines l
+            JOIN shabads s ON s.id = l.shabad_id
+            {joins}
+            {clause}""", args)}
 
 
 @app.get("/api/similar/{line_id}")
@@ -2212,6 +2749,8 @@ def get_similar(
     raag: Optional[List[str]] = Query(None),
     writer: Optional[List[str]] = Query(None),
     length: Optional[List[str]] = Query(None),
+    scope: str = "mine",
+    user=Depends(current_user),
 ):
     """Lines related in meaning to this one, merged across enabled models.
 
@@ -2232,24 +2771,31 @@ def get_similar(
     another does not reliably mean the first match is better. If that starts to
     skew the list, sort on best RANK instead -- a #1 is a #1 whoever said it.
     """
+    uid = user["id"]
     conn = library(write=True)      # writes model_results: a record of what was shown
     try:
+        # The join is the permission check: asking about a line in a shabad I
+        # have not added is a 404, so this cannot be used to probe the catalogue.
         q = conn.execute(
             """SELECT l.id, l.gurmukhi, l.translation_en, l.teeka_pa, l.line_no,
                       s.id AS shabad_id, s.source_line, s.raag_en, s.writer, s.ang
-               FROM lines l JOIN shabads s ON s.id = l.shabad_id
-               WHERE l.id = ?""", (line_id,)).fetchone()
+               FROM lines l
+               JOIN shabads s ON s.id = l.shabad_id
+               JOIN user_shabads us ON us.shabad_id = s.id
+               WHERE l.id = ? AND us.user_id = ?""", (line_id, uid)).fetchone()
         if not q:
             raise HTTPException(404, "no such line")
 
-        allowed = allowed_line_ids(conn, status, rarity, genre, speed,
+        if scope not in SCOPES:
+            raise HTTPException(400, f"scope must be one of {', '.join(SCOPES)}")
+        allowed = allowed_line_ids(conn, uid, scope, status, rarity, genre, speed,
                                    raag, writer, length)
         # A filter combination nothing matches is not the same as an unindexed
         # line, and saying "not indexed yet" there would send you off to run the
         # indexer over a library that is already complete.
-        if allowed is not None and not allowed:
+        if not allowed:
             return {"query": dict(q), "results": [], "models": models_enabled(conn),
-                    "reason": "no match", "more": False}
+                    "reason": "no match", "more": False, "scope": scope}
 
         models = models_enabled(conn)
         # Each model's top (offset+limit+1), then page the MERGE. Any line in the
@@ -2274,12 +2820,16 @@ def get_similar(
             # a fault. Only an empty FIRST page means nothing has been indexed.
             return {"query": dict(q), "results": [], "models": models,
                     "reason": "not indexed yet" if not offset else "no more",
-                    "more": False}
+                    "more": False, "scope": scope}
 
         rows = {r["id"]: dict(r) for r in conn.execute(
+            # Catalogue columns only -- no user_shabads, no tags. That is what
+            # makes scope="all" safe: there is nothing of anybody's opinion in
+            # here to leak, only Gurbani. banidb_shabad_id rides along so a
+            # discovered shabad can be added straight from the result card.
             f"""SELECT l.id, l.gurmukhi, l.translation_en, l.teeka_pa, l.line_no,
                        s.id AS shabad_id, s.source_line, s.source_line_no,
-                       s.raag_en, s.writer, s.ang,
+                       s.raag_en, s.writer, s.ang, s.banidb_shabad_id,
                        (SELECT COUNT(*) FROM lines x WHERE x.shabad_id = s.id)
                          AS line_count
                 FROM lines l JOIN shabads s ON s.id = l.shabad_id
@@ -2287,8 +2837,18 @@ def get_similar(
             tuple(rid for rid, _ in page))}
 
         verdicts = {r["result_line_id"]: r["verdict"] for r in conn.execute(
-            "SELECT result_line_id, verdict FROM line_relations WHERE query_line_id = ?",
-            (line_id,))}
+            """SELECT result_line_id, verdict FROM line_relations
+               WHERE user_id = ? AND query_line_id = ?""", (uid, line_id))}
+
+        # Which of these I already have. Under `all` the rest are discoveries,
+        # and the card offers to add them -- which is the whole point of
+        # exploring outside your own library.
+        shabad_ids = {r["shabad_id"] for r in rows.values()}
+        ph = ",".join("?" * len(shabad_ids))
+        my_shabads = {r[0] for r in conn.execute(
+            f"""SELECT shabad_id FROM user_shabads
+                WHERE user_id = ? AND shabad_id IN ({ph})""",
+            [uid, *shabad_ids])} if shabad_ids else set()
 
         # Only what was actually put in front of me, at its true unfiltered rank.
         # Recording the whole prefix would credit models for results this page
@@ -2302,33 +2862,37 @@ def get_similar(
 
         # `page` is already in merged order; do not re-sort.
         results = [{**rows[rid], "by": by, "verdict": verdicts.get(rid, 0),
+                    "in_library": rows[rid]["shabad_id"] in my_shabads,
                     "score": max(v["score"] for v in by.values()),
                     "best_rank": min(v["rank"] for v in by.values())}
                    for rid, by in page if rid in rows]
         return {"query": dict(q), "results": results, "models": models,
-                "reason": None, "more": more, "offset": offset}
+                "reason": None, "more": more, "offset": offset, "scope": scope}
     finally:
         conn.close()
 
 
 @app.post("/api/relations")
-def post_relation(body: Relation):
+def post_relation(body: Relation, user=Depends(current_user)):
     """Record a judgement. verdict 0 deletes it, so a mis-tap is undoable."""
+    uid = user["id"]
     conn = library(write=True)
     try:
         with conn:
             if body.verdict == 0:
                 conn.execute("DELETE FROM line_relations "
-                             "WHERE query_line_id = ? AND result_line_id = ?",
-                             (body.query_line_id, body.result_line_id))
+                             "WHERE user_id = ? AND query_line_id = ? "
+                             "AND result_line_id = ?",
+                             (uid, body.query_line_id, body.result_line_id))
             else:
                 conn.execute(
-                    """INSERT INTO line_relations (query_line_id, result_line_id, verdict)
-                       VALUES (?,?,?)
-                       ON CONFLICT(query_line_id, result_line_id)
+                    """INSERT INTO line_relations
+                         (user_id, query_line_id, result_line_id, verdict)
+                       VALUES (?,?,?,?)
+                       ON CONFLICT(user_id, query_line_id, result_line_id)
                        DO UPDATE SET verdict = excluded.verdict,
                                      judged_at = datetime('now')""",
-                    (body.query_line_id, body.result_line_id,
+                    (uid, body.query_line_id, body.result_line_id,
                      1 if body.verdict > 0 else -1))
         return {"ok": True, "verdict": body.verdict}
     finally:
@@ -2336,9 +2900,14 @@ def post_relation(body: Relation):
 
 
 @app.get("/api/scores")
-def get_scores():
-    """Per-model tallies from my votes, discounted by how prominently each
+def get_scores(user=Depends(current_user)):
+    """Per-model tallies from MY votes, discounted by how prominently each
     model offered the line.
+
+    Scoped to one account on purpose. A shared tally would mean my judgement of
+    which model is better was quietly averaged with somebody else's -- and the
+    whole value of these votes (CLAUDE.md §3) is that they are one person's
+    considered opinion about Gurbani, not a crowd's.
 
     credit = verdict / log2(rank + 2). A hit at #2 is worth about 2.7x one at
     #19 -- a plain 1/rank would say 9.5x, which over-punishes a result that is
@@ -2358,7 +2927,8 @@ def get_scores():
                 (r["model"], r["rank"]))
         votes = {(r["query_line_id"], r["result_line_id"]): r["verdict"]
                  for r in conn.execute(
-                     "SELECT query_line_id, result_line_id, verdict FROM line_relations")}
+                     """SELECT query_line_id, result_line_id, verdict
+                        FROM line_relations WHERE user_id = ?""", (user["id"],))}
 
         stats = {m["name"]: {**m, "up": 0, "down": 0, "dcg": 0.0, "ideal": 0.0,
                              "unique_up": 0, "unique_down": 0} for m in models}

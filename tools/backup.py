@@ -34,35 +34,51 @@ BACKUP_DIR = os.path.join(ROOT, "backups")
 
 # Column order matches the original Notion export, so a re-import needs no
 # fiddling. Extras are appended after those.
-NOTION_COLUMNS = ["Shabad", "Genre", "Rarity", "Speed", "Status", "Notes",
-                  "Ang", "Raag", "Writer", "BaniDbShabadId", "Interested"]
+#
+# Account leads, because every account's library is in the one csv. Splitting
+# into a file each would mean a restore had to find and reassemble them, and
+# the whole point of the csv is that it survives everything -- including this
+# program.
+NOTION_COLUMNS = ["Account", "Shabad", "Genre", "Rarity", "Speed", "Status",
+                  "Notes", "Ang", "Raag", "Writer", "BaniDbShabadId", "Interested"]
 
 UNTAGGED = "Not chosen"
 
 
 def rows_for_export(conn):
+    users = {r["id"]: r["username"] for r in conn.execute(
+        "SELECT id, username FROM users")} or {None: ""}
+
     tags = {}
-    for t in conn.execute("SELECT shabad_id, kind, value FROM tags ORDER BY value"):
-        tags.setdefault(t["shabad_id"], {}).setdefault(t["kind"], []).append(t["value"])
+    for t in conn.execute(
+            "SELECT user_id, shabad_id, kind, value FROM tags ORDER BY value"):
+        tags.setdefault((t["user_id"], t["shabad_id"]), {}) \
+            .setdefault(t["kind"], []).append(t["value"])
 
     # Shortlists are working state rather than description, but they're still
     # something only I can produce -- a shortlist built the night before a
     # program is worth a column. Missing on databases older than the deck.
     try:
-        shortlisted = {r[0] for r in conn.execute(
-            "SELECT shabad_id FROM shortlist WHERE list = 'Interested'")}
+        shortlisted = {(r["user_id"], r["shabad_id"]) for r in conn.execute(
+            "SELECT user_id, shabad_id FROM shortlist WHERE list = 'Interested'")}
     except sqlite3.OperationalError:
         shortlisted = set()
 
     out = []
-    for s in conn.execute("SELECT * FROM shabads ORDER BY id"):
-        mine = tags.get(s["id"], {})
+    for s in conn.execute(
+            """SELECT us.user_id, s.id, s.source_line, s.ang, s.raag_en, s.writer,
+                      s.banidb_shabad_id, us.rarity, us.status, us.notes
+               FROM user_shabads us JOIN shabads s ON s.id = us.shabad_id
+               ORDER BY us.user_id, s.id"""):
+        key = (s["user_id"], s["id"])
+        mine = tags.get(key, {})
 
         def joined(kind):
             vals = [v for v in mine.get(kind, []) if v != UNTAGGED]
             return ", ".join(vals)      # "Not chosen" was a blank cell in Notion
 
         out.append({
+            "Account": users.get(s["user_id"], s["user_id"]),
             "Shabad": s["source_line"],
             "Genre": joined("genre"),
             "Rarity": s["rarity"] or "",
@@ -73,7 +89,7 @@ def rows_for_export(conn):
             "Raag": s["raag_en"] or "",
             "Writer": s["writer"] or "",
             "BaniDbShabadId": s["banidb_shabad_id"] or "",
-            "Interested": "Yes" if s["id"] in shortlisted else "",
+            "Interested": "Yes" if key in shortlisted else "",
         })
     return out
 
@@ -85,23 +101,27 @@ def rows_for_export(conn):
 # This used to be one row per LINE with SM-2 state -- level, ease, interval,
 # due date. That scheduling layer was removed (it went unused), so there is far
 # less to preserve: which shabads, and when each was last practised.
-LEARNING_COLUMNS = ["BaniDbShabadId", "Shabad", "Lines", "AddedAt", "LastPractised"]
+LEARNING_COLUMNS = ["Account", "BaniDbShabadId", "Shabad", "Lines", "Status",
+                    "AddedAt", "LastPractised"]
 
 
 def learning_rows(conn):
     """Empty list on databases predating the memorization feature."""
     try:
         cur = conn.execute("""
-            SELECT s.banidb_shabad_id, s.source_line,
+            SELECT u.username, s.banidb_shabad_id, s.source_line,
                    (SELECT COUNT(*) FROM lines l WHERE l.shabad_id = s.id),
-                   lg.added_at, lg.last_practised
-            FROM learning lg JOIN shabads s ON s.id = lg.shabad_id
-            ORDER BY lg.added_at""")
+                   lg.status, lg.added_at, lg.last_practised
+            FROM learning lg
+            JOIN shabads s ON s.id = lg.shabad_id
+            LEFT JOIN users u ON u.id = lg.user_id
+            ORDER BY lg.user_id, lg.added_at""")
     except sqlite3.OperationalError:
         return []
     return [{
-        "BaniDbShabadId": r[0] or "", "Shabad": r[1], "Lines": r[2],
-        "AddedAt": r[3] or "", "LastPractised": r[4] or "",
+        "Account": r[0] or "", "BaniDbShabadId": r[1] or "", "Shabad": r[2],
+        "Lines": r[3], "Status": r[4] or "", "AddedAt": r[5] or "",
+        "LastPractised": r[6] or "",
     } for r in cur]
 
 

@@ -219,6 +219,14 @@
           <button id="sim-filter-clear" class="secondary">Clear all filters</button>
         </div>
       </details>
+      <!-- Search my own shabads, or every indexed line in the shared
+           catalogue. The second is how you find shabads you don't have yet --
+           and how a brand-new account has anything to explore on day one.
+           It shows Gurbani only: never anybody's status, notes or tags. -->
+      <div class="scope-btns">
+        <button class="mode-btn on" data-scope="mine">My library</button>
+        <button class="mode-btn" data-scope="all">Everything</button>
+      </div>
       <span id="sim-count" class="muted"></span>
     </div>
   </div>
@@ -233,7 +241,9 @@
 <section id="view-settings" hidden>
   <h2>Settings</h2>
 
-  <div class="panel">
+  <!-- data-admin: hidden for ordinary accounts. The server refuses these
+       endpoints with a 403 regardless, so this is tidiness, not the defence. -->
+  <div class="panel" data-admin hidden>
     <h3>Indexing</h3>
     <label class="set-row">
       <input type="checkbox" id="set-auto-index">
@@ -245,6 +255,18 @@
           Only one pass ever runs at a time.</div>
       </div>
     </label>
+  </div>
+
+  <div class="panel">
+    <h3>Account</h3>
+    <div class="set-row">
+      <div>
+        <b id="me-name">…</b>
+        <div class="muted" id="me-role"></div>
+      </div>
+      <span class="spacer"></span>
+      <button id="sign-out" class="secondary">Sign out</button>
+    </div>
   </div>
 
   <div class="panel">
@@ -262,7 +284,7 @@
     </label>
   </div>
 
-  <div class="panel">
+  <div class="panel" data-admin hidden>
     <h3>Summariser models</h3>
     <p class="muted">Switching one off stops it contributing results. Nothing is
       deleted &mdash; its summaries and every vote you have cast survive, so
@@ -279,7 +301,7 @@
     <div id="set-scores"></div>
   </div>
 
-  <div class="panel">
+  <div class="panel" data-admin hidden>
     <h3>Control panel</h3>
     <p class="muted">Balance, indexing coverage, interrupted runs, integrity
       checks and the indexer's log. Everything that is normally invisible.</p>
@@ -326,6 +348,18 @@
   <div class="panel">
     <h3>Library</h3>
     <div id="st-library"></div>
+  </div>
+
+  <!-- Accounts. Only the admin ever sees this page at all. -->
+  <div class="panel">
+    <h3>Accounts</h3>
+    <p class="muted">Each account has its own private library. The Gurbani
+      catalogue is shared, so anything one person adds that another already has
+      costs nothing to index and is searchable straight away.</p>
+    <div id="st-users"></div>
+    <div class="st-actions">
+      <button id="st-add-user" class="secondary">Add an account</button>
+    </div>
   </div>
 
   <div class="panel">

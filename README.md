@@ -72,9 +72,34 @@ reboot brings everything back with nobody logged in.
 
 Remove it with `powershell -File tools\register-task.ps1 -Remove`.
 
+### Accounts
+
+Everyone signs in at `/login`. Each account has its own **completely private**
+library — shabads, tags, notes, shortlist, history, learning list, votes.
+
+The **Gurbani itself is shared**, which is the good part: if your dad adds a
+shabad you already have, its summaries and vectors already exist, so it costs
+nothing to index and is searchable for him immediately.
+
+**Managing accounts** — Settings → Control panel → Accounts (admin only):
+
+- **Add an account** — username + password, that's it
+- **Reset password** — signs that person out everywhere
+- **Delete** — removes the account and everything in their library. Asks you to
+  type the username first. The Gurbani is kept, since others may have it.
+
+There is no signup page. You create accounts by hand, which is right for four
+people who know each other.
+
+```powershell
+python tools/test_isolation.py     # proves no account can see another's library
+```
+
+That runs against a throwaway copy and never touches your real database.
+
 ### The password
 
-Every request needs it except `/health`. Your browser asks once and remembers.
+Every request needs a signed-in account except `/health`.
 
 **There is no exemption for localhost, deliberately.** `cloudflared` runs on
 this machine and proxies to `http://localhost:8000`, so every request off the

@@ -210,13 +210,25 @@ Write-Host ''
 Write-Host '  Shabad Library' -ForegroundColor Cyan
 Write-Host ''
 
-if (-not $DotEnv['APP_PASSWORD'] -and -not $NoTunnel) {
-    Write-Host '  APP_PASSWORD is not set in .env.' -ForegroundColor Red
-    Write-Host '  A tunnel without it publishes your library to anyone who finds' -ForegroundColor Red
-    Write-Host '  the link, with permission to edit and delete. Set one, or pass' -ForegroundColor Red
-    Write-Host '  -NoTunnel to run locally.' -ForegroundColor Red
-    Write-Host ''
-    exit 1
+# Does the database have any accounts?
+#
+# This used to check APP_PASSWORD in .env, which is now wrong: since accounts
+# moved into the database, .env's password only ever SEEDS the first admin at
+# migration. Change your password in the app and .env goes stale -- so a check
+# against it would either block a perfectly secure setup or, worse, pass on a
+# database with no accounts at all.
+if (-not $NoTunnel) {
+    $probe = python -c "import sqlite3,sys; d=sqlite3.connect(r'$Root\shabads.db'); print(d.execute('SELECT COUNT(*) FROM users').fetchone()[0])" 2>$null
+    if ($LASTEXITCODE -ne 0 -or [int]$probe -lt 1) {
+        Write-Host '  This database has no accounts.' -ForegroundColor Red
+        Write-Host '  A tunnel without one publishes your library to anyone who' -ForegroundColor Red
+        Write-Host '  finds the link. Run:' -ForegroundColor Red
+        Write-Host '      python tools\migrate_multiuser.py --write' -ForegroundColor Red
+        Write-Host '  or pass -NoTunnel to run locally.' -ForegroundColor Red
+        Write-Host ''
+        exit 1
+    }
+    Say "$probe account(s) registered"
 }
 
 Stop-Everything

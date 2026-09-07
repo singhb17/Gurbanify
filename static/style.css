@@ -722,6 +722,30 @@ body.deck-view { padding-bottom: 0; overflow: hidden; }
 }
 .en-foot { margin: .2rem 0 0; font-size: .78rem; line-height: 1.5; }
 
+/* ---------- login ---------- */
+
+.login-body {
+  display: flex; align-items: center; justify-content: center;
+  min-height: 100vh; padding: 1rem;
+}
+.login-card {
+  width: min(22rem, 100%); padding: 1.6rem;
+  background: var(--surface); border: 1px solid var(--border); border-radius: 12px;
+}
+.login-card h1 { margin: 0 0 .2rem; font-size: 1.3rem; }
+.login-card .muted { display: block; margin-bottom: 1.2rem; font-size: .88rem; }
+.login-card label {
+  display: block; margin: .8rem 0 .25rem;
+  font-size: .74rem; text-transform: uppercase; letter-spacing: .05em;
+  color: var(--text-faint);
+}
+.login-card input { width: 100%; font-size: 1rem; }
+.login-card button { width: 100%; margin-top: 1.4rem; padding: .55rem; }
+.login-err {
+  margin-top: .9rem; padding: .55rem .7rem; border-radius: 8px; font-size: .87rem;
+  background: #2a1c1b; border-left: 3px solid var(--danger); color: #ffb3b0;
+}
+
 /* ---------- advanced filter disclosure ---------- */
 
 /* Raag and writer live behind this. They are real filters that are almost
@@ -756,6 +780,20 @@ body.deck-view { padding-bottom: 0; overflow: hidden; }
 /* ---------- similar page filters ---------- */
 
 .sim-filters { margin-bottom: .6rem; }
+.scope-btns { display: flex; gap: .3rem; }
+
+/* A result from outside my library: readable, clearly not mine, and offering
+   the one action that makes sense for it. */
+.sim-result.foreign {
+  border-style: dashed;
+  cursor: default;
+}
+.sim-add {
+  margin-left: auto; font-size: .76rem; padding: .2rem .5rem;
+  background: transparent; border: 1px solid var(--green-fg); color: var(--green-fg);
+}
+.sim-add:hover:not(:disabled) { background: var(--green-bg); }
+.sim-add:disabled { opacity: .5; }
 .sim-more { display: flex; justify-content: center; padding: 1rem 0 2rem; }
 .sim-more button { min-width: 12rem; }
 
@@ -853,6 +891,10 @@ body.deck-view { padding-bottom: 0; overflow: hidden; }
             color: var(--text-faint); }
 .st-row-v { margin: .1rem 0; }
 .st-row-why { font-size: .78rem; line-height: 1.45; }
+.user-row { position: relative; }
+.user-actions { display: flex; gap: .4rem; margin-top: .5rem; flex-wrap: wrap; }
+.user-actions button { font-size: .78rem; padding: .25rem .5rem; }
+
 .st-row-v .ok { color: var(--green-fg); }
 .st-row-v .warn-text { color: var(--orange-fg); }
 
