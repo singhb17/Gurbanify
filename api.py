@@ -380,16 +380,35 @@ SIMILAR_LIMIT = 20          # §3: about twenty results, ranked, never threshold
 
 
 @app.on_event("startup")
-def require_migrated_database():
-    """Refuse to start on a single-user database.
+def require_usable_database():
+    """Refuse to start on a missing or un-migrated database.
 
-    The multi-account split moves columns between tables, so a half-migrated
-    database is not something to paper over at runtime: the app would run,
-    queries would return nothing, and it would look like the library had been
-    lost. Better to stop with the command that fixes it.
+    Two failures, one rule: stop with the command that fixes it rather than
+    starting and quietly returning nothing.
+
+    MISSING. This used to return early and let the app come up, on the theory
+    that a fresh install has no database yet. It does not: schema.sql is applied
+    by tools/import_shabads.py, and every other machine gets the file by hand
+    (MOVING.md). So the early return only ever fired when something was wrong,
+    and what followed was worse than a crash -- the first write CREATED a 0-byte
+    shabads.db, the next startup filled it with empty tables, and the result is
+    a file that looks exactly like the library. It sorts next to the real one,
+    it backs up like the real one, and it reads as though everything was lost.
+
+    UN-MIGRATED. The multi-account split moves columns between tables, so a
+    half-migrated database is not something to paper over at runtime either.
     """
     if not os.path.exists(LIBRARY_DB):
-        return
+        sys.exit(f"""
+  No library database at {LIBRARY_DB}
+
+  The app will not create one. An empty database is worse than no database:
+  it starts, shows nothing, and looks exactly like data loss.
+
+  If the library is on another machine, copy it here.
+  If this is genuinely a new install, build one:
+      python tools/import_shabads.py
+""")
     conn = sqlite3.connect(LIBRARY_DB)
     try:
         have = {r[0] for r in conn.execute(
@@ -424,7 +443,7 @@ def ensure_deck_schema():
             # The personal tables. All carry user_id since the multi-account
             # split -- these definitions are for a FRESH database; an existing
             # one is restructured by tools/migrate_multiuser.py, which
-            # require_migrated_database() insists on having been run.
+            # require_usable_database() insists on having been run.
             conn.execute("""
                 CREATE TABLE IF NOT EXISTS shortlist (
                   user_id    INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
@@ -633,8 +652,13 @@ def library(write=False, all_users=False):
     cross-account work -- the control panel's totals, backups, admin screens --
     and every use of it should be obvious from the surrounding code.
     """
-    conn = sqlite3.connect(LIBRARY_DB if write else f"file:{LIBRARY_DB}?mode=ro",
-                           uri=not write,
+    # mode=rw, never the default rwc: sqlite3.connect() on a path that does not
+    # exist CREATES it, silently and empty. Startup refuses a missing database,
+    # but a check runs once and this runs on every request -- rename the file
+    # out from under a live app and the check is already behind you. This makes
+    # the empty file impossible rather than merely unlikely.
+    conn = sqlite3.connect(f"file:{LIBRARY_DB}?mode={'rw' if write else 'ro'}",
+                           uri=True,
                            factory=sqlite3.Connection if all_users else GuardedConnection)
     conn.row_factory = sqlite3.Row
     conn.execute("PRAGMA foreign_keys = ON")
