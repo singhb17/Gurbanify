@@ -4,6 +4,7 @@ Everything you need day to day: starting it, backing it up, adding shabads,
 indexing, and what to do when something breaks.
 
 - **`README.md`** — what this project is
+- **`MOVING.md`** — moving to another machine, and making changes later
 - **`CLAUDE.md`** — every design decision and why
 - **this file** — the buttons
 
@@ -13,8 +14,7 @@ indexing, and what to do when something breaks.
 
 - [Every day](#every-day)
 - [Running it over the internet](#running-it-over-the-internet)
-- [Moving to another machine](#moving-to-another-machine)
-- [Making changes later](#making-changes-later)
+- [Moving machines, and making changes later](#moving-machines-and-making-changes-later)
 - [Backups](#backups)
 - [Adding shabads](#adding-shabads)
 - [Searching](#searching)
@@ -142,122 +142,16 @@ Cloudflare. Worth it the day the random links become annoying.
 
 ---
 
-## Moving to another machine
+## Moving machines, and making changes later
 
-**Three things live outside git and must be carried by hand:**
+Both procedures live in their own file so they are easy to find in a hurry:
 
-| | |
-|---|---|
-| `shabads.db` | your library, accounts, summaries, vectors. **Irreplaceable.** |
-| `banidb.db` | the Gurbani corpus. 91 MB, regenerable, but copying beats rebuilding |
-| `.env` | your OpenRouter key and ntfy topic |
+**→ [MOVING.md](MOVING.md)**
 
-**Everything else comes from GitHub.** Accounts live *inside* `shabads.db`, so
-every login works the moment the file lands — there is nothing to recreate.
-
-### On the new machine
-
-```powershell
-# 1. install python 3.11+ and cloudflared first, then:
-git clone https://github.com/singhb17/Gurbanify.git
-cd Gurbanify
-python -m pip install fastapi uvicorn requests
-
-# 2. copy shabads.db, banidb.db and .env into this folder by hand
-#    (USB stick, OneDrive, scp -- anything)
-
-# 3. check it works locally before exposing it
-powershell -File tools\serve.ps1 -NoTunnel
-#    open http://localhost:8000 and sign in
-
-# 4. then the real thing
-.\restart.bat
-
-# 5. make it survive reboots (run as Administrator)
-powershell -File tools\register-task.ps1
-Start-ScheduledTask -TaskName GurbanifyWatchdog
-```
-
-`sentence-transformers` is only needed on a machine that will **index** — it
-pulls in torch, about 2.5 GB. Skip it if indexing stays on the other machine.
-
-### THE ONE RULE
-
-**There is exactly one live `shabads.db`, and after the move it is the one on
-the home PC.**
-
-Delete or rename the old one on the laptop the moment the move is done. Two
-copies both being written to will diverge within a day, and SQLite has no merge
-— you would be picking which week of edits to throw away.
-
----
-
-## Making changes later
-
-Two kinds of change, and the difference is only ever **"does the database shape
-change?"**
-
-### A. Code only — the normal case
-
-Anything in `static/`, most of `api.py`, the tools, the scripts. No new column,
-no new table.
-
-```powershell
-# on the home PC
-cd C:\path\to\Gurbanify
-git pull
-.\restart.bat
-```
-
-**That is the whole procedure.** The database is untouched, so there is nothing
-to move and nothing to migrate. Hard-refresh the browser if a page looks stale
-(`Ctrl+Shift+R`), though the asset stamping in `api.py` should make that
-unnecessary.
-
-### B. The database shape changes — new column, new table, moved data
-
-**The database still never leaves the home PC.** The change travels as a
-*migration script* that runs there, the same way `tools/migrate_multiuser.py`
-did.
-
-```powershell
-# on the home PC
-cd C:\path\to\Gurbanify
-git pull
-python tools\backup.py                    # ALWAYS first
-python tools\migrate_<name>.py            # dry run: prints what it would do
-python tools\migrate_<name>.py --write    # do it
-.\restart.bat
-```
-
-Every migration script in this project follows the same three rules, and any
-new one must too:
-
-- **Dry run by default.** Running it with no flags prints the plan and changes nothing.
-- **Safe to run twice.** Each step checks whether it has already happened.
-- **All or nothing.** One transaction; a failure leaves the database exactly as it was.
-
-`api.py` also refuses to start against a database it knows is un-migrated,
-rather than running and quietly returning nothing.
-
-### Do I ever copy the database back to the laptop?
-
-**Only ever as a throwaway test copy, and never back again.**
-
-Sometimes a migration is worth testing against real data before it runs on the
-only copy that matters. Then:
-
-1. Copy `shabads.db` **to** the laptop — this copy is a **test fixture, not a library**
-2. Test the migration against it
-3. **Delete it.** Do not open the app against it, do not edit anything in it
-4. Push the finished migration; run it on the home PC as above
-
-**Never copy a database from the laptop back to the home PC.** The moment you
-do, whichever edits you made on the home PC in the meantime are gone. If you
-find yourself wanting to, the answer is a migration script instead.
-
-`tools/test_isolation.py` already works this way — it copies the library to a
-temp folder, migrates and attacks the copy, and throws it away.
+- first move from the laptop to the home PC, step by step
+- what to do for a code-only change (pull, restart)
+- what to do when the database shape changes (a migration script, run there)
+- **the one rule**: exactly one live `shabads.db`, and it is on the home PC
 
 ---
 
@@ -441,9 +335,12 @@ This section is what you'd use to evaluate a *replacement* model.
 
 **One-time setup**
 
-```bash
-python -m pip install sentence-transformers   # ~2.5 GB with torch
+```powershell
+powershell -ExecutionPolicy Bypass -File tools\setup.ps1
 ```
+
+That installs everything, including the embedding model's dependencies. See
+[MOVING.md](MOVING.md) for a new machine from scratch.
 
 Your OpenRouter key goes in `.env` at the project root (never commit it):
 
@@ -673,6 +570,7 @@ the databases by sitting beside them. Grouped by job:
 | `tools/serve.ps1` | the actual logic behind it |
 | `tools/watchdog.ps1` | runs forever, restarts what dies, pushes the new link |
 | `tools/register-task.ps1` | installs the watchdog to run at boot |
+| `tools/setup.ps1` | one-command install for a new machine |
 | `tools/loadtest.js` | do the frontend scripts load? catches what `node --check` can't |
 | `tools/migrate_multiuser.py` | the one-time split into shared catalogue + private libraries |
 | `tools/test_isolation.py` | proves no account can see another's library |
@@ -682,6 +580,8 @@ the databases by sitting beside them. Grouped by job:
 | file | |
 |---|---|
 | `README.md` | what this project is — the GitHub landing page |
+| `MOVING.md` | moving machines, and making changes later |
+| `requirements.txt` | every python package, with why each is needed |
 | `INSTRUCTIONS.md` | this — how to run it |
 | `CLAUDE.md` | every design decision and why |
 

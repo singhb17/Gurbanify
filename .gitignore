@@ -39,5 +39,9 @@ logs/
 # LLM summaries the bench paid for -- deleting them costs real money to
 # replace, which makes them the one generated artifact worth versioning.
 
+# The virtual environment tools/setup.ps1 creates. Machine-specific and huge
+# (torch alone is ~2.5 GB) -- rebuilt by running setup again, never committed.
+.venv/
+
 __pycache__/
 *.pyc

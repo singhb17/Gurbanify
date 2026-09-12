@@ -77,8 +77,11 @@ OpenRouter · Cloudflare Tunnel
 
 ## Running it
 
-See **[INSTRUCTIONS.md](INSTRUCTIONS.md)** — setup, daily use, backups,
-indexing, and what to do when something breaks.
+**[MOVING.md](MOVING.md)** — setting it up on a new machine, in order, from
+one command.
+
+**[INSTRUCTIONS.md](INSTRUCTIONS.md)** — daily use, backups, indexing, and what
+to do when something breaks.
 
 **[CLAUDE.md](CLAUDE.md)** holds every design decision and the reasoning behind
 it, including the things that were tried and deliberately removed.

@@ -40,6 +40,12 @@ $Root = Split-Path $PSScriptRoot -Parent
 $LogDir = Join-Path $Root 'logs'
 if (-not (Test-Path $LogDir)) { New-Item -ItemType Directory $LogDir | Out-Null }
 
+# Prefer the project's own virtual environment, which tools/setup.ps1 creates.
+# Without this the venv would be a trap: setup installs everything into it and
+# then the server starts under the SYSTEM python and reports fastapi missing.
+$VenvPy = Join-Path $Root '.venv\Scripts\python.exe'
+$Py = if (Test-Path $VenvPy) { $VenvPy } else { 'python' }
+
 function Say($msg, $colour = 'Gray') { Write-Host "  $msg" -ForegroundColor $colour }
 
 # ---------------------------------------------------------------- .env
@@ -103,7 +109,7 @@ function Stop-Everything {
 function Start-App {
     $out = Join-Path $LogDir 'server.log'
     $err = Join-Path $LogDir 'server.err.log'
-    $p = Start-Process -FilePath 'python' `
+    $p = Start-Process -FilePath $Py `
         -ArgumentList '-m', 'uvicorn', 'api:app', '--host', '127.0.0.1', '--port', $Port `
         -WorkingDirectory $Root -WindowStyle Hidden -PassThru `
         -RedirectStandardOutput $out -RedirectStandardError $err
@@ -218,7 +224,7 @@ Write-Host ''
 # against it would either block a perfectly secure setup or, worse, pass on a
 # database with no accounts at all.
 if (-not $NoTunnel) {
-    $probe = python -c "import sqlite3,sys; d=sqlite3.connect(r'$Root\shabads.db'); print(d.execute('SELECT COUNT(*) FROM users').fetchone()[0])" 2>$null
+    $probe = & $Py -c "import sqlite3,sys; d=sqlite3.connect(r'$Root\shabads.db'); print(d.execute('SELECT COUNT(*) FROM users').fetchone()[0])" 2>$null
     if ($LASTEXITCODE -ne 0 -or [int]$probe -lt 1) {
         Write-Host '  This database has no accounts.' -ForegroundColor Red
         Write-Host '  A tunnel without one publishes your library to anyone who' -ForegroundColor Red

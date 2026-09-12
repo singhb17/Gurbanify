@@ -1,0 +1,33 @@
+# Everything the app and the indexing pipeline need.
+#
+# Minimums, not pins. These are the versions this was built and tested against
+# (2026-09); anything newer should be fine and a pin would only rot.
+#
+# Install with tools/setup.ps1, which also handles cloudflared and checks the
+# databases are in place. Or by hand: python -m pip install -r requirements.txt
+
+# --- the web app ---
+fastapi>=0.141
+uvicorn>=0.52
+requests>=2.32
+
+# --- similarity search ---
+# numpy does the cosine maths at query time. The app NEVER loads an embedding
+# model (CLAUDE.md §7) -- it only reads vectors already in the database.
+numpy>=2.3
+
+# --- indexing: turning summaries into vectors ---
+# sentence-transformers pulls in torch, which is most of the ~2.5 GB. Only
+# needed on a machine that runs search/index_library.py or search/embed.py --
+# but that is any machine that will ever add a shabad with auto-index on.
+sentence-transformers>=5.7
+
+# --- the model bench in search/ ---
+# silhouette score and vector normalisation. Only used by bench.py and
+# test_clustering.py, never by the running app.
+scikit-learn>=1.9
+
+# --- rebuilding banidb.db from the BaniDB MySQL container ---
+# Only for tools/extract_corpus.py, which needs Docker. Not needed if you
+# copied banidb.db across rather than rebuilding it.
+pymysql>=1.2
