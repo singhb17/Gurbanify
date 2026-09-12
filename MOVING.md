@@ -42,19 +42,38 @@ USB stick, OneDrive, whatever. **These are the only things git does not have:**
 Accounts live *inside* `shabads.db`, so both logins work the moment it lands.
 Nothing to recreate.
 
-### 3. On the home PC — install Python, then everything else
+### 3. On the home PC — install Python and Git, then clone
 
-Install **Python 3.11 or newer** from [python.org](https://www.python.org/downloads/).
+**Two things have to be installed by hand**, because they are what everything
+else gets installed *with*. `tools/setup.ps1` does all the rest, but it cannot
+install the tool used to fetch it.
+
+**Python 3.11 or newer** from [python.org](https://www.python.org/downloads/).
 **Tick "Add python.exe to PATH"** on the first screen — almost every setup
 problem traces back to that box.
 
-Then:
+**Git**, which is both how the code gets here and how every later change
+arrives:
+
+```powershell
+winget install --id Git.Git -e
+```
+
+**Then close the terminal and open a new one.** An installer only puts itself on
+PATH for *new* windows, so in the window you installed from, `git` is still
+"not recognised" — which looks exactly like the install having failed.
+
+Now:
 
 ```powershell
 cd C:\wherever\you\want
 git clone https://github.com/singhb17/Gurbanify.git
 cd Gurbanify
 ```
+
+> **Do not download the ZIP from GitHub instead.** It works once and then traps
+> you: a ZIP is not a repo, so `git pull` never works, and every future update
+> means downloading and unpacking the whole thing by hand.
 
 Now **put the three files from step 2 into this folder**, then:
 
@@ -188,6 +207,7 @@ is a migration script.
 
 | | |
 |---|---|
+| `git` not recognised | either git is not installed (`winget install --id Git.Git -e`) or the window predates the install — open a new terminal |
 | `python` not recognised | Python installed without "Add to PATH". Re-run its installer → Modify → tick it |
 | `cloudflared` not recognised | close the terminal and open a new one; winget updates PATH only for new shells |
 | setup says a database is missing | step 2 — the file has to be in the project folder, beside `api.py` |

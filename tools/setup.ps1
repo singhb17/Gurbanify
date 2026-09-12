@@ -28,6 +28,13 @@ function Warn($m) { Write-Host "  [warn] $m" -ForegroundColor Yellow }
 function Bad($m)  { Write-Host "  [FAIL] $m" -ForegroundColor Red
                     $script:problems += $m }
 
+# winget puts a new tool on PATH for NEW shells only, so this window cannot see
+# what it just installed unless we re-read PATH ourselves.
+function Sync-Path {
+    $env:Path = [Environment]::GetEnvironmentVariable('Path', 'Machine') + ';' +
+                [Environment]::GetEnvironmentVariable('Path', 'User')
+}
+
 Write-Host ''
 Write-Host '  Gurbanify setup' -ForegroundColor Cyan
 Write-Host ''
@@ -86,6 +93,37 @@ if ($SkipTorch) {
 }
 Ok 'python packages installed'
 
+# ---------------------------------------------------------------- git
+
+# The app runs fine without git. Every LATER change does not: `git pull` is the
+# entire update path (MOVING.md), so a missing git is a problem that only shows
+# up weeks from now, at the worst moment. Check for it while someone is looking.
+if (Get-Command git -ErrorAction SilentlyContinue) {
+    Ok 'git is installed'
+} elseif (Get-Command winget -ErrorAction SilentlyContinue) {
+    Info 'installing git with winget ...'
+    try {
+        winget install --id Git.Git -e --accept-source-agreements `
+                       --accept-package-agreements --silent | Out-Null
+    } catch {
+        Warn "winget could not install it: $($_.Exception.Message)"
+    }
+    Sync-Path
+    if (Get-Command git -ErrorAction SilentlyContinue) {
+        Ok 'git installed'
+    } else {
+        Warn 'git installed but not on PATH in THIS window -- close it and open a new one'
+    }
+} else {
+    Warn 'git is missing and winget is unavailable. Get it from https://git-scm.com/download/win -- without it, `git pull` cannot fetch later changes.'
+}
+
+# A ZIP download is not a repo. It works today and then never updates, and the
+# error you get much later ("not a git repository") does not point back here.
+if (-not (Test-Path (Join-Path $Root '.git'))) {
+    Warn 'this folder is not a git clone -- downloaded as a ZIP? `git pull` will never work here. Clone it instead: git clone https://github.com/singhb17/Gurbanify.git'
+}
+
 # ---------------------------------------------------------------- cloudflared
 
 if (Get-Command cloudflared -ErrorAction SilentlyContinue) {
@@ -98,9 +136,7 @@ if (Get-Command cloudflared -ErrorAction SilentlyContinue) {
     } catch {
         Warn "winget could not install it: $($_.Exception.Message)"
     }
-    # winget updates PATH for NEW shells, not this one
-    $env:Path = [Environment]::GetEnvironmentVariable('Path', 'Machine') + ';' +
-                [Environment]::GetEnvironmentVariable('Path', 'User')
+    Sync-Path
     if (Get-Command cloudflared -ErrorAction SilentlyContinue) {
         Ok 'cloudflared installed'
     } else {
