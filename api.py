@@ -733,19 +733,33 @@ def spawn_indexer(model=None, budget=AUTO_INDEX_BUDGET):
     script = os.path.join(HERE, "search", "index_library.py")
     if not os.path.exists(script):
         return
+    exe = sys.executable
     kw = {}
     if os.name == "nt":
         # no console window, and survives the server being closed
         kw["creationflags"] = (subprocess.CREATE_NO_WINDOW
                                | subprocess.DETACHED_PROCESS)
+        # ...except that CREATE_NO_WINDOW applies to the process we launch and
+        # not to anything that process launches in turn, and a venv python.exe
+        # can be a small stub that re-execs the real interpreter. The stub gets
+        # no window; the interpreter it starts gets a fresh console, which is
+        # how a blank terminal appears beside an app nobody asked one from --
+        # and closing it kills the indexer mid-run.
+        #
+        # pythonw.exe is the same interpreter built for the GUI subsystem, so
+        # Windows never gives it a console at any depth. Output already goes to
+        # a file, so there is nothing a console was doing for us.
+        cand = os.path.join(os.path.dirname(exe), "pythonw.exe")
+        if os.path.exists(cand):
+            exe = cand
     else:
         kw["start_new_session"] = True
     try:
         log = open(INDEX_LOG, "a", encoding="utf-8", errors="replace")
         log.write(f"\n=== spawn {datetime.datetime.now():%Y-%m-%d %H:%M:%S} "
-                  f"(python: {sys.executable}) ===\n")
+                  f"(python: {exe}) ===\n")
         log.flush()
-        cmd = [sys.executable, "-u", script, "--yes",
+        cmd = [exe, "-u", script, "--yes",
                "--max-spend", "%.4f" % budget]
         if model:
             cmd += ["--model", model]
@@ -842,6 +856,11 @@ def credit_balance():
 # other over the same row.
 JOB_SILENT_S = 600
 
+# How old the indexer's lock file may get before nobody is holding it. Must stay
+# at or above search/index_library.py's LOCK_STALE_S, which is what actually
+# decides when a new run may take it -- see lock_state() for why.
+INDEX_LOCK_STALE_S = 600
+
 EMBED_DIMS = 1024                      # BGE-M3 (CLAUDE.md §7)
 EMBED_BYTES = EMBED_DIMS * 4           # float32
 BACKUP_STALE_DAYS = 7
@@ -910,12 +929,19 @@ def lock_state():
     a reboot mid-run, a closed terminal. It blocks every later run silently,
     which is exactly the kind of failure that is invisible from the app and
     obvious here.
+
+    The age is meaningful because a live indexer touches its lock every 30s
+    (index_library.LOCK_HEARTBEAT_S), so a lock that has stopped moving is a
+    dead one, however long the run itself was going to take. Kept a little
+    longer than the indexer's own LOCK_STALE_S of 300s: by the time this says
+    "stale" the next run has already been free to take the lock, so the alert
+    describes a real problem rather than racing the fix for it.
     """
     path = os.path.join(HERE, "search", ".index.lock")
     if not os.path.exists(path):
         return {"held": False}
     age = time.time() - os.path.getmtime(path)
-    return {"held": True, "age_s": int(age), "stale": age > 6 * 3600}
+    return {"held": True, "age_s": int(age), "stale": age > INDEX_LOCK_STALE_S}
 
 
 def backup_state():
@@ -1013,9 +1039,12 @@ def build_alerts(conn, models, jobs, lock, backups, credit, ver):
                 "It contributes nothing to search until it has summaries.")
 
     if lock.get("stale"):
-        add("error", "Stale indexing lock",
-            f"Held for {lock['age_s'] // 3600}h with nothing running — a killed "
-            "process. It blocks new runs until removed.")
+        # No longer an error: the next run takes a stale lock by itself. Worth
+        # saying anyway, because it means a run died without finishing.
+        add("warn", "Stale indexing lock",
+            f"Untouched for {lock['age_s'] // 60} min, so the process holding "
+            "it died — a reboot mid-run, or a closed window. The next run "
+            "clears it automatically; delete search/.index.lock to clear it now.")
 
     if backups["age_days"] is None:
         add("error", "No backups",

@@ -36,6 +36,7 @@ import json
 import os
 import sqlite3
 import sys
+import threading
 import time
 
 sys.stdout.reconfigure(encoding="utf-8")
@@ -50,6 +51,23 @@ MODELS_PATH = os.path.join(HERE, "models.json")
 CHUNK = 25
 EMBED_BATCH = 16
 LOCK_PATH = os.path.join(HERE, ".index.lock")
+
+# A live run touches its lock every LOCK_HEARTBEAT_S; a lock older than
+# LOCK_STALE_S therefore belongs to a process that is gone.
+#
+# This used to be six hours, on the reasoning that a real run can be long. It
+# can, but a lock that nobody is holding blocked every later run for those six
+# hours -- and the control panel's "stale lock" alert waited the same six hours
+# to say so, which is the worst possible pairing: silently wedged, with the one
+# thing that would explain it deliberately keeping quiet. Closing the indexer's
+# window was enough to trigger it.
+#
+# A heartbeat separates "long" from "dead", which age alone cannot. It runs on a
+# daemon thread rather than in the work loop so it also covers the parts that
+# block for minutes without looping: a slow OpenRouter chunk, and the first-ever
+# BGE-M3 download. Ten times the heartbeat is a wide margin for a paused laptop.
+LOCK_HEARTBEAT_S = 30
+LOCK_STALE_S = 300
 
 # A cooperative stop, written by the app when a model is switched off mid-run.
 #
@@ -98,12 +116,30 @@ def take_lock():
         if e.errno != errno.EEXIST:
             raise
         age = time.time() - os.path.getmtime(LOCK_PATH)
-        if age < 6 * 3600:
-            raise AlreadyRunning(f"another indexer started {age / 60:.0f} min ago")
+        if age < LOCK_STALE_S:
+            raise AlreadyRunning(
+                f"another indexer was alive {age:.0f}s ago")
         os.unlink(LOCK_PATH)                       # stale; the process died
         fd = os.open(LOCK_PATH, os.O_CREAT | os.O_EXCL | os.O_WRONLY)
     os.write(fd, str(os.getpid()).encode())
     os.close(fd)
+    start_heartbeat()
+
+
+def start_heartbeat():
+    """Keep saying "still here" for as long as this process lives.
+
+    A daemon thread, so it cannot hold the program open, and it stops the
+    instant the process dies -- which is exactly the signal take_lock reads.
+    """
+    def beat():
+        while True:
+            time.sleep(LOCK_HEARTBEAT_S)
+            try:
+                os.utime(LOCK_PATH, None)
+            except OSError:
+                return                             # lock gone; nothing to hold
+    threading.Thread(target=beat, daemon=True, name="lock-heartbeat").start()
 
 
 def drop_lock():
