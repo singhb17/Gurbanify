@@ -2359,7 +2359,8 @@ def line_quiz(line_id: int, user=Depends(current_user)):
 # --- searching BaniDB to add something new ----------------------------------
 
 @app.get("/api/search")
-def search(q: str, mode: str = "firstletter", source: Optional[str] = None, limit: int = 40):
+def search(q: str, mode: str = "firstletter", source: Optional[str] = None,
+           limit: int = 40, user=Depends(current_user)):
     """STTM-style. mode=firstletter matches 'gkbvv'; mode=fullword matches Gurmukhi."""
     q = q.strip()
     if len(q) < 2:
@@ -2398,10 +2399,16 @@ def search(q: str, mode: str = "firstletter", source: Optional[str] = None, limi
         rows += [dict(r) for r in conn.execute(sql2, args2)]
     conn.close()
 
-    have = set()
+    # MY library, not the catalogue. Before the multi-account split these were
+    # the same table and a bare query was right. Afterwards `shabads` is the
+    # shared catalogue, so this reported "already in library" for a shabad I had
+    # deleted -- deletion leaves the catalogue row on purpose -- and for one only
+    # somebody else has, which also leaks the shape of their library.
     lib = library()
-    for r in lib.execute("SELECT banidb_shabad_id FROM shabads"):
-        have.add(r[0])
+    have = {r[0] for r in lib.execute(
+        """SELECT s.banidb_shabad_id
+             FROM user_shabads us JOIN shabads s ON s.id = us.shabad_id
+            WHERE us.user_id = ?""", (user["id"],))}
     lib.close()
     for r in rows:
         r["already_have"] = r["shabad_id"] in have
@@ -2409,7 +2416,7 @@ def search(q: str, mode: str = "firstletter", source: Optional[str] = None, limi
 
 
 @app.get("/api/preview/{banidb_shabad_id}")
-def preview(banidb_shabad_id: int):
+def preview(banidb_shabad_id: int, user=Depends(current_user)):
     """Every verse of a shabad, to confirm before adding."""
     conn = corpus()
     verses = [dict(r) for r in conn.execute(
@@ -2418,9 +2425,16 @@ def preview(banidb_shabad_id: int):
     if not verses:
         raise HTTPException(404, "no such shabad")
 
+    # "Do I have it", not "does it exist" -- see /api/search above. This one
+    # drives the Add button: reading it from the catalogue meant the button was
+    # replaced by "open shabad", pointing at a detail page that correctly 404s
+    # because the shabad is not mine. No way forward from there.
     lib = library()
-    existing = lib.execute("SELECT id FROM shabads WHERE banidb_shabad_id = ?",
-                           (banidb_shabad_id,)).fetchone()
+    existing = lib.execute(
+        """SELECT s.id FROM shabads s
+             JOIN user_shabads us ON us.shabad_id = s.id
+            WHERE s.banidb_shabad_id = ? AND us.user_id = ?""",
+        (banidb_shabad_id, user["id"])).fetchone()
     lib.close()
     return {
         "banidb_shabad_id": banidb_shabad_id,

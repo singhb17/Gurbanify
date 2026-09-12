@@ -158,7 +158,6 @@ def main():
 
 def run(base, requests):
     from api import hash_password
-    import sqlite3
 
     # --- two accounts, one of them not the admin ---------------------------
     admin = requests.Session()
@@ -292,11 +291,56 @@ def run(base, requests):
     check("health stays open", anon.get(base + "/health", timeout=20).status_code == 200)
 
     # --- the second account can still USE the app --------------------------
-    with sqlite3.connect(os.path.join(ROOT, "shabads.db")) as _:
-        pass                                   # (real db untouched; just asserting import)
     cat = other.get(base + "/api/search?q=gkbvv&mode=firstletter", timeout=60)
     check("shared catalogue search still works for a new account",
           cat.status_code == 200)
+
+    # --- "already in library" means MINE, not "exists" ---------------------
+    # Deleting leaves the catalogue row on purpose: its lines and vectors cost
+    # real money and somebody else may have the same shabad. So membership has
+    # to be asked of user_shabads. Asked of `shabads` instead -- which was right
+    # before the accounts split, when they were one table -- a deleted shabad
+    # stays un-addable forever, with the Add button replaced by a link to a
+    # detail page that correctly 404s. The same query also reported another
+    # account's shabads as mine, which is a peek at their shelf.
+    rest = sorted(my_ids - {sid})
+    if rest:
+        victim = rest[0]
+        vd = admin.get(f"{base}/api/shabads/{victim}", timeout=30).json()
+        bid, line_no = vd["banidb_shabad_id"], vd["source_line_no"]
+        fl = next((l.get("first_letters") for l in vd.get("lines", [])
+                   if l["line_no"] == line_no and l.get("first_letters")), None)
+
+        def marked(sess):
+            """Does /api/search tell this account it already has `bid`?"""
+            if not fl:
+                return None
+            res = sess.get(base + "/api/search", timeout=60,
+                           params={"q": fl[:12], "mode": "firstletter"}).json()
+            hit = next((r for r in res.get("results", [])
+                        if r["shabad_id"] == bid), None)
+            return hit and hit.get("already_have")
+
+        p = other.get(f"{base}/api/preview/{bid}", timeout=30).json()
+        check("preview does not show another's shabad as mine",
+              p.get("already_have_id") is None, f"leaked id {p.get('already_have_id')}")
+        check("search does not show another's shabad as mine", not marked(other))
+
+        p = admin.get(f"{base}/api/preview/{bid}", timeout=30).json()
+        check("preview does see a shabad I really have",
+              p.get("already_have_id") == victim, f"got {p.get('already_have_id')}")
+
+        check("delete removes it from my library",
+              admin.delete(f"{base}/api/shabads/{victim}", timeout=20).status_code == 200)
+
+        p = admin.get(f"{base}/api/preview/{bid}", timeout=30).json()
+        check("a deleted shabad is no longer 'already in library'",
+              p.get("already_have_id") is None, f"still reports {p.get('already_have_id')}")
+        check("search stops marking a deleted shabad", not marked(admin))
+
+        r = admin.post(base + "/api/shabads", timeout=60,
+                       json={"banidb_shabad_id": bid, "source_line_no": line_no})
+        check("a deleted shabad can be added back", r.status_code == 200, r.text[:160])
 
 
 if __name__ == "__main__":
