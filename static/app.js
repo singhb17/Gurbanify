@@ -1094,6 +1094,8 @@ async function loadLearn() {
         </div>
       </div>
       <div class="card-btns">
+        <button class="practise" data-id="${s.id}"
+                title="Practise this shabad">Learn</button>
         <button class="unlearn secondary" data-id="${s.id}"
                 title="Remove from the list">&times;</button>
       </div>
@@ -1126,6 +1128,13 @@ async function loadLearn() {
 
   $('learn-list').onclick = async (e) => {
     if (e.target.closest('.learn-status')) return;      // the dropdown, not the card
+
+    // Practising is a deliberate choice, so it gets its own button. Tapping the
+    // card does what tapping a card does everywhere else in the app -- opens the
+    // shabad -- rather than dropping you into a drill you did not ask for.
+    const go2 = e.target.closest('.practise');
+    if (go2) { e.stopPropagation(); startPractice(go2.dataset.id); return; }
+
     const drop = e.target.closest('.unlearn');
     if (drop) {
       e.stopPropagation();
@@ -1139,7 +1148,7 @@ async function loadLearn() {
       return;
     }
     const card = e.target.closest('.card');
-    if (card) startPractice(card.dataset.id);
+    if (card) go('detail', { id: card.dataset.id });
   };
 }
 

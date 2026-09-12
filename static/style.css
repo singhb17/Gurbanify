@@ -586,6 +586,7 @@ body.deck-view { padding-bottom: 0; overflow: hidden; }
   .card > .card-btns { position: absolute; top: .4rem; right: .4rem; }
   .card-btns .heart { position: static; }
   #history-list .card-main { padding-right: 4.2rem; }
+  #learn-list .card-main { padding-right: 5.4rem; }
 }
 
 /* ---------- memorization ---------- */
@@ -612,6 +613,15 @@ body.deck-view { padding-bottom: 0; overflow: hidden; }
   font-size: .78rem; padding: .2rem .4rem; margin-bottom: .35rem;
   background: var(--surface-2); border: 1px solid var(--border);
 }
+/* Practising is the deliberate action, so it looks like a button rather than
+   an icon. The card itself opens the shabad, as cards do everywhere else. */
+.practise {
+  padding: .25rem .55rem; font-size: .8rem; line-height: 1.2;
+  background: transparent; border: 1px solid var(--border-hi);
+  color: var(--text-dim);
+}
+.practise:hover { border-color: var(--accent); color: var(--accent); }
+
 .learn-status.red   { color: var(--danger); }
 .learn-status.amber { color: var(--orange-fg); }
 .learn-status.green { color: var(--green-fg); }
