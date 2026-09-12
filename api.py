@@ -56,11 +56,10 @@ def load_env():
 
 load_env()
 
-# Set APP_PASSWORD in .env and every request needs it. Left unset, there is no
-# auth at all -- which is right on a laptop and wrong the moment the tunnel is
-# up, so the tunnel scripts refuse to start without one.
-APP_USER = os.environ.get("APP_USER", "keertan")
-APP_PASSWORD = os.environ.get("APP_PASSWORD", "")
+# No APP_USER / APP_PASSWORD here any more. Accounts live in the `users` table
+# (CLAUDE.md §16) -- these were left over from the Basic Auth this replaced, and
+# a dead constant named APP_PASSWORD is exactly the thing someone greps for when
+# they want to know how passwords work.
 
 app = FastAPI(title="Shabad Library")
 

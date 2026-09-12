@@ -316,7 +316,9 @@ Set-Content (Join-Path $LogDir 'current-url.txt') $url -Encoding ASCII
 Write-Host ''
 Write-Host "  $url" -ForegroundColor Green
 Write-Host ''
-Say "sign in as '$($DotEnv['APP_USER'])' if it asks." 'DarkGray'
+# The database is the only place that knows who the accounts are; .env's copy
+# was a seed that goes stale the moment a password or name changes in the app.
+Say "sign in with your account." 'DarkGray'
 Write-Host ''
 
 Send-Ntfy 'New Shabad Library link' $url 'link'
