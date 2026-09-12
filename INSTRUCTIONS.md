@@ -514,6 +514,31 @@ Don't use `uvicorn --reload` — its workers outlive the parent and keep serving
 
 **"Can't reach BaniDB MySQL"** — `docker start banidb-api`, wait ~10s.
 
+**Indexing writes its summaries and then dies at "embedding N summaries"** —
+look in `logs/index.log` for `WinError 1114`, "a dynamic link library (DLL)
+initialization routine failed". torch's DLLs will not load, and the cause is
+almost always a Visual C++ runtime older than torch needs. It wants **14.20 or
+newer**; a 2017-era 14.11 is common and nothing else on the machine ever
+complains about it, because Python itself only needs the half that is already
+there. Check what you have:
+
+```powershell
+Get-ItemProperty 'HKLM:\SOFTWARE\Microsoft\VisualStudio\14.0\VC\Runtimes\x64' | Select-Object Version
+```
+
+Install [the current one](https://aka.ms/vs/17/release/vc_redist.x64.exe) — the
+14.x series is a single shared runtime, so this upgrades in place and breaks
+nothing — then open a **new terminal** and finish the job:
+
+```powershell
+.\.venv\Scripts\python.exe search\index_library.py --embed-only
+```
+
+**That costs nothing.** Summaries are checkpointed as they are paid for, so a
+crash in the embedding phase never loses them; embedding is local and free.
+`tools\setup.ps1` now checks this and installs the runtime itself, so re-running
+it is the other way to fix it.
+
 **Restore from a backup:**
 ```bash
 copy backups\shabads-<stamp>.db shabads.db

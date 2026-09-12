@@ -43,12 +43,51 @@ def unpack(blob):
 _MODEL = None
 
 
+class ModelUnavailable(RuntimeError):
+    """torch is installed but this machine cannot load it.
+
+    Its own exception type because it is the one failure in this file that is
+    about the machine rather than the data: nothing in the library is wrong,
+    nothing was spent, and the fix is an installer rather than a rerun. Callers
+    catch it to say that, instead of letting forty lines of DLL traceback be the
+    only explanation an indexing log ever offers.
+    """
+
+
+def _load_hint(e):
+    """What to actually do about a failed import.
+
+    WinError 1114 is 'the DLL loaded and its initialisation routine failed',
+    which is not the same as 'a file is missing' and does not read like the
+    version problem it usually is. torch's DLLs need the Visual C++ runtime at
+    14.20 or newer -- that is where vcruntime140_1.dll first appears -- and a
+    machine can carry a 2017-era 14.11 for years with nothing else complaining,
+    because Python itself only ever needs the half that is already there.
+    """
+    if os.name == "nt" and "1114" in str(e):
+        return ("torch's DLLs will not load. The Visual C++ runtime is almost "
+                "certainly too old -- install the current one from "
+                "https://aka.ms/vs/17/release/vc_redist.x64.exe, open a NEW "
+                "terminal, and run this again.")
+    return ("torch could not be imported. Run tools/setup.ps1 -- it checks for "
+            "exactly this and names the fix.")
+
+
 def load_model():
     """Cached per process. Loading takes ~30s, so anything that embeds more than
     once in a run must not pay that repeatedly."""
     global _MODEL
     if _MODEL is None:
-        from sentence_transformers import SentenceTransformer
+        try:
+            from sentence_transformers import SentenceTransformer
+        except ImportError as e:
+            raise ModelUnavailable(
+                f"sentence-transformers is not installed ({e}). "
+                "Run tools/setup.ps1, or: pip install -r requirements.txt") from e
+        except OSError as e:
+            # An OSError from an *import* is a native library that would not
+            # load, never a missing .py -- so it gets the installer advice.
+            raise ModelUnavailable(f"{e}\n  {_load_hint(e)}") from e
         print(f"loading {MODEL_NAME} (first run downloads ~2.3 GB)...", flush=True)
         _MODEL = SentenceTransformer(MODEL_NAME, device="cpu")
     return _MODEL

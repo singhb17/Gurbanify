@@ -82,9 +82,9 @@ powershell -ExecutionPolicy Bypass -File tools\setup.ps1
 ```
 
 That does the rest: a virtual environment, every Python package including the
-embedding model's dependencies, cloudflared via winget, and a check that the
-databases and `.env` are all present. **It takes a while** — torch alone is
-about 2.5 GB.
+embedding model's dependencies, the Visual C++ runtime those need in order to
+actually load, cloudflared via winget, and a check that the databases and `.env`
+are all present. **It takes a while** — torch alone is about 2.5 GB.
 
 It prints a tick or a cross for every step, and refuses to say "Ready" until
 they all pass. Safe to run again if something needed fixing.
@@ -231,6 +231,7 @@ is a migration script.
 | setup says a database is missing | step 2 — the file has to be in the project folder, beside `api.py` |
 | app starts, login fails | the password is in the database, not `.env`. Use the one you set in the app |
 | "not been migrated for multiple accounts" | `python tools\migrate_multiuser.py --write` |
+| indexing dies at "embedding N summaries", `WinError 1114` | the Visual C++ runtime is older than torch needs. Install [the current one](https://aka.ms/vs/17/release/vc_redist.x64.exe), new terminal, then `python search\index_library.py --embed-only` — free, the summaries were already saved |
 | link stopped working | the tunnel restarted. Check ntfy for the new one, or `.\restart.bat` |
 
 Everything else: **[INSTRUCTIONS.md](INSTRUCTIONS.md)**.

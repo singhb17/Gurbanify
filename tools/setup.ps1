@@ -200,6 +200,77 @@ foreach ($line in (& $pyExe $probe)) {
 }
 Remove-Item $probe -ErrorAction SilentlyContinue
 
+# ---------------------------------------------------------------- torch loads
+
+# The check above uses find_spec, which proves a package is ON DISK and nothing
+# more. torch is a stack of native DLLs that can install perfectly and still
+# refuse to load, and the way that surfaces is brutal: the app runs, shabads
+# save, summaries get written and PAID FOR, and only then -- minutes into an
+# indexing run, in a log file nobody is watching -- does embedding die with
+# WinError 1114. This script's whole job is to find that here instead.
+#
+# The usual cause is an out-of-date Visual C++ runtime. torch needs 14.20+ (the
+# first version with vcruntime140_1.dll); a machine can carry a 2017-era 14.11
+# indefinitely without anything else noticing, because Python itself only needs
+# the part that is already there. The 14.x series is one shared runtime that
+# upgrades in place, so installing the current one replaces the old rather than
+# sitting beside it, and cannot break anything already working.
+if (-not $SkipTorch) {
+    $tprobe = Join-Path $env:TEMP 'gurbanify-torch.py'
+    @'
+import importlib.util as u
+if not u.find_spec("torch"):
+    print("SKIP")
+else:
+    try:
+        import torch
+        print("OK " + torch.__version__)
+    except BaseException as e:
+        print("FAIL " + type(e).__name__ + ": " + " ".join(str(e).split())[:200])
+'@ | Set-Content -Path $tprobe -Encoding UTF8
+
+    Info 'checking torch can actually load ...'
+    $r = (& $pyExe $tprobe) -join ' '
+
+    if ($r -like 'FAIL*') {
+        Warn "torch is installed but will not load -- $($r.Substring(5))"
+        $vcKey = 'HKLM:\SOFTWARE\Microsoft\VisualStudio\14.0\VC\Runtimes\x64'
+        $vc = (Get-ItemProperty $vcKey -ErrorAction SilentlyContinue).Version
+        Info "Visual C++ runtime: $(if ($vc) { $vc } else { 'not installed' })"
+        Info 'installing the current Visual C++ runtime (upgrades in place) ...'
+        $vcExe = Join-Path $env:TEMP 'vc_redist.x64.exe'
+        try {
+            # Deliberately the direct installer and not winget: winget matches on
+            # the package being present at all, so an ancient 14.11 makes it
+            # decide there is nothing to do and report success.
+            $oldPref = $ProgressPreference
+            $ProgressPreference = 'SilentlyContinue'
+            Invoke-WebRequest 'https://aka.ms/vs/17/release/vc_redist.x64.exe' `
+                              -OutFile $vcExe -UseBasicParsing
+            $ProgressPreference = $oldPref
+            Start-Process $vcExe -ArgumentList '/install','/passive','/norestart' -Wait
+            Remove-Item $vcExe -ErrorAction SilentlyContinue
+            $now = (Get-ItemProperty $vcKey -ErrorAction SilentlyContinue).Version
+            Info "Visual C++ runtime is now $now"
+        } catch {
+            Warn "could not install it: $($_.Exception.Message)"
+        }
+        $r = (& $pyExe $tprobe) -join ' '
+    }
+
+    if ($r -like 'OK*') {
+        Ok "torch loads ($($r.Substring(3)))"
+    } elseif ($r -notlike 'SKIP*') {
+        # Already reported as a missing optional package if it was SKIP.
+        Bad ("torch will not load, so indexing cannot embed anything: $r " +
+             '-- install https://aka.ms/vs/17/release/vc_redist.x64.exe by hand, ' +
+             'then open a NEW terminal and run this again. If that runtime is ' +
+             'already current, the CPU may predate this torch build: ' +
+             'pip install --force-reinstall torch==2.2.2')
+    }
+    Remove-Item $tprobe -ErrorAction SilentlyContinue
+}
+
 if (Test-Path (Join-Path $Root 'shabads.db')) {
     $countPy = Join-Path $env:TEMP 'gurbanify-count.py'
     @'
