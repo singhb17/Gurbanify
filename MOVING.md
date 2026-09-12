@@ -123,8 +123,26 @@ with nobody logged in.
 
 ### 7. Retire the laptop's copy
 
-**Rename `shabads.db` to `shabads.db.OLD` on the laptop.** See
-[the one rule](#the-one-rule).
+**Last, and only once the home PC is actually serving.** Until then the laptop
+is still the only live copy, and retiring it early just stops the app that is
+currently doing the work.
+
+Two things to do on the laptop, in this order:
+
+```powershell
+# 1. stop the watchdog, or it keeps restarting a server that cannot work
+#    and ntfy alerts you about it every time
+Get-Process powershell | Where-Object { $_.Path -and
+  (Get-CimInstance Win32_Process -Filter "ProcessId=$($_.Id)").CommandLine -like '*watchdog.ps1*' } |
+  Stop-Process -Force
+
+# 2. then retire the database
+Rename-Item shabads.db shabads.db.OLD
+```
+
+Doing it in the other order is harmless but noisy. The app refuses to start
+without a database rather than creating an empty one, so nothing is at risk
+either way. See [the one rule](#the-one-rule).
 
 ---
 
