@@ -346,9 +346,19 @@ def summarise(conn, key, name, reg, ver, use_batch, limit):
     started, spent, done = time.time(), 0.0, 0
     written = 0
     job = Job(conn, name, len(groups))
+    # The chunk is two things at once: how often the job row moves, and how much
+    # paid work a kill can throw away. A run shorter than one chunk gets the bad
+    # end of both -- it reports 0 until it reports done, and being stopped half
+    # way loses every summary it bought. One added shabad is exactly that run:
+    # 15 lines against a CHUNK of 25 is a single step, which is why the badge
+    # went straight from 0/15 to done while the console counted 1..15.
+    #
+    # Four steps minimum, and never coarser than CHUNK. A full-library run is
+    # unaffected: 5,000 lines still chunks at 25.
+    step = max(1, min(CHUNK, -(-len(groups) // 4)))
     try:
-        for i in range(0, len(groups), CHUNK):
-            chunk = groups[i:i + CHUNK]
+        for i in range(0, len(groups), step):
+            chunk = groups[i:i + step]
             out, usage = summarise_rows(
                 key, model_id, [g["row"] for g in chunk],
                 workers=reg[name].get("workers", 6),
@@ -394,7 +404,7 @@ def summarise(conn, key, name, reg, ver, use_batch, limit):
 
 def embed_all(conn):
     """Vectors for every summary that hasn't got one. Local, free, resumable."""
-    from embed import load_model, pack
+    from embed import ModelUnavailable, load_model, pack
 
     rows = conn.execute(
         "SELECT model, line_id, summary FROM line_summaries "
@@ -408,7 +418,20 @@ def embed_all(conn):
     # seconds of apparent silence and is exactly when someone looks at the badge
     # and concludes nothing is happening.
     job = Job(conn, ",".join(sorted({r["model"] for r in rows})), len(rows), "embed")
-    model = load_model()
+    try:
+        model = load_model()
+    except ModelUnavailable as e:
+        # A machine problem, not a data one. Mark the job failed with the reason
+        # rather than dying and leaving sweep_dead_jobs to call it "stalled" ten
+        # minutes later -- stalled is what a killed run looks like, and this is
+        # a run that knows exactly what is wrong with it.
+        job.finish("failed", str(e).replace("\n", " "))
+        say(f"\n  CANNOT EMBED: {e}")
+        say(f"\n  The {len(rows)} summaries are safe. Nothing was lost and "
+            "nothing was spent -- embedding is local and free, so once the "
+            "above is fixed this costs nothing to finish:")
+        say("      python search/index_library.py --embed-only")
+        return
     started = time.time()
     try:
         for i in range(0, len(rows), EMBED_BATCH):
